@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+  <path
+    d="M0 12H24"
+    stroke="#64748B"
+    stroke-width="2"
+  />
+  <path
+    d="M12 4V24"
+    stroke="#6F89B8"
+    stroke-width="2"
+  />
+  <path
+    d="M3 12V9A9 9 0 0 1 12 0A9 9 0 0 1 21 9V12"
+    fill="none"
+    stroke="#64748B"
+    stroke-width="2"
+  />
+</svg>
