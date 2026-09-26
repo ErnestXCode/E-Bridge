@@ -1379,27 +1379,26 @@ function App() {
               >
                 <button
                   onClick={copySelection}
-                  disabled={selectionMode && !selection}
                   className={`rounded-md border px-3 py-1.5 text-[9px] font-medium uppercase tracking-[0.1em] transition ${
-                    selectionMode && !selection
-                      ? "cursor-crosshair border-[#536d9f]/20 bg-[#536d9f]/10 text-[#91a7cf]"
-                      : selectionMode && hasStructuredSelection
-                        ? "border-[#536d9f]/30 bg-[#536d9f]/15 text-[#c3d1ea] hover:bg-[#536d9f]/25"
+                    hasStructuredSelection
+                      ? "border-blue-400 bg-blue-600 text-white shadow-[0_0_14px_rgba(37,99,235,0.35)] hover:bg-blue-500"
+                      : selectionMode
+                        ? "border-[#536d9f]/40 bg-[#536d9f]/15 text-[#b9c9e5]"
                         : "border-white/[0.07] bg-white/[0.025] text-slate-400 hover:border-[#536d9f]/30 hover:bg-[#536d9f]/10 hover:text-[#b9c9e5]"
                   }`}
                   title={
-                    selectionMode
-                      ? selection
-                        ? "Copy the selected area"
-                        : "Drag across the document"
-                      : "Activate rectangular selection"
+                    hasStructuredSelection
+                      ? "Copy the selected area"
+                      : selectionMode
+                        ? "Drag across the document to select an area"
+                        : "Activate rectangular selection"
                   }
                 >
-                  {selectionMode
-                    ? selection
-                      ? "Copy Selection"
-                      : "Select to Copy"
-                    : "Select to Copy"}
+                  {hasStructuredSelection
+                    ? "Copy Selection"
+                    : selectionMode
+                      ? "Select Mode On"
+                      : "Select to Copy"}
                 </button>
 
                 <button
@@ -1901,7 +1900,6 @@ function EmptyState({ onOpen }) {
                 className="group flex items-center gap-3 rounded-lg bg-slate-200 px-5 py-2.5 text-[10px] font-semibold uppercase tracking-[0.16em] text-[#080b10] transition hover:bg-white"
               >
                 Open PDF
-
                 <svg
                   viewBox="0 0 16 16"
                   fill="none"
@@ -1983,9 +1981,7 @@ function EmptyState({ onOpen }) {
               01
             </div>
 
-            <h2 className="mt-2 text-sm font-medium text-slate-300">
-              Read
-            </h2>
+            <h2 className="mt-2 text-sm font-medium text-slate-300">Read</h2>
 
             <p className="mt-1.5 max-w-xs text-[10px] leading-4.5 text-slate-600">
               Read the document normally and use your own judgement to identify
@@ -1998,9 +1994,7 @@ function EmptyState({ onOpen }) {
               02
             </div>
 
-            <h2 className="mt-2 text-sm font-medium text-slate-300">
-              Select
-            </h2>
+            <h2 className="mt-2 text-sm font-medium text-slate-300">Select</h2>
 
             <p className="mt-1.5 max-w-xs text-[10px] leading-4.5 text-slate-600">
               Choose the exact table, section, or page you need. E-BRIDGE
@@ -2013,9 +2007,7 @@ function EmptyState({ onOpen }) {
               03
             </div>
 
-            <h2 className="mt-2 text-sm font-medium text-slate-300">
-              Use
-            </h2>
+            <h2 className="mt-2 text-sm font-medium text-slate-300">Use</h2>
 
             <p className="mt-1.5 max-w-xs text-[10px] leading-4.5 text-slate-600">
               Copy the structured result directly into Excel and continue your
@@ -2030,9 +2022,9 @@ function EmptyState({ onOpen }) {
           </div>
 
           <p className="mt-2 max-w-3xl text-[10px] leading-5 text-slate-700">
-            Currently tested on text-based annual reports. Image-based PDFs
-            are not supported. Tables with irregular layouts or missing cells
-            may require a quick visual check after pasting.
+            Currently tested on text-based annual reports. Image-based PDFs are
+            not supported. Tables with irregular layouts or missing cells may
+            require a quick visual check after pasting.
           </p>
 
           <div className="mt-4 flex flex-wrap gap-x-6 gap-y-2 text-[8px] uppercase tracking-[0.15em] text-slate-700">
