@@ -22,6 +22,19 @@ function clamp(value, min, max) {
   return Math.min(Math.max(value, min), max);
 }
 
+function median(values) {
+  if (!values.length) return 0;
+
+  const sorted = [...values].sort((a, b) => a - b);
+  const middle = Math.floor(sorted.length / 2);
+
+  if (sorted.length % 2 === 0) {
+    return (sorted[middle - 1] + sorted[middle]) / 2;
+  }
+
+  return sorted[middle];
+}
+
 /* ============================================================
    PDF TEXT
 ============================================================ */
@@ -49,6 +62,7 @@ function buildRows(items) {
     if (Math.abs(a.y - b.y) > 5) {
       return b.y - a.y;
     }
+
     return a.x - b.x;
   });
 
@@ -109,6 +123,7 @@ function mergeRowFragments(row) {
         y: item.y,
         height: item.height,
       });
+
       continue;
     }
 
@@ -116,9 +131,16 @@ function mergeRowFragments(row) {
 
     if (gap >= 0 && gap < 18) {
       previous.text += ` ${item.text}`;
-      previous.right = Math.max(previous.right, item.x + item.width);
-      previous.width = previous.right - previous.x;
-      previous.height = Math.max(previous.height, item.height);
+      previous.right = Math.max(
+        previous.right,
+        item.x + item.width,
+      );
+      previous.width =
+        previous.right - previous.x;
+      previous.height = Math.max(
+        previous.height,
+        item.height,
+      );
     } else {
       cells.push({
         text: item.text,
@@ -143,11 +165,30 @@ function isNumericText(text) {
 
   if (!trimmed) return false;
 
-  if (/^[-–—]+$/.test(trimmed)) return true;
+  /*
+    Dash / em dash / hyphen are treated as financial values.
+  */
+  if (/^[-–—]+$/.test(trimmed)) {
+    return true;
+  }
 
-  if (/^#+$/.test(trimmed)) return true;
+  /*
+    PDF extraction occasionally produces ###.
+  */
+  if (/^#+$/.test(trimmed)) {
+    return true;
+  }
 
+  /*
+    Remove common financial formatting:
+      commas
+      parentheses
+      %
+      plus/minus
+      spaces
+  */
   const stripped = trimmed
+    .replace(/\s+/g, "")
     .replace(/^\(/, "")
     .replace(/\)$/, "")
     .replace(/,/g, "")
@@ -155,6 +196,16 @@ function isNumericText(text) {
     .replace(/%$/, "")
     .trim();
 
+  /*
+    Examples accepted:
+      1
+      1.5
+      1,500
+      (1,500)
+      12%
+      -500
+      2025
+  */
   return /^\d+(\.\d+)?$/.test(stripped);
 }
 
@@ -163,7 +214,10 @@ function isNumericText(text) {
 ============================================================ */
 
 function normalizeFinancialValue(text) {
-  const value = text.replace(/\t/g, " ").replace(/\r?\n/g, " ").trim();
+  const value = text
+    .replace(/\t/g, " ")
+    .replace(/\r?\n/g, " ")
+    .trim();
 
   if (!value) return "";
 
@@ -175,105 +229,271 @@ function normalizeFinancialValue(text) {
 }
 
 /* ============================================================
-   COLUMN BOUNDARY DETECTION
+   NUMERIC COLUMN DETECTION
 ============================================================ */
 
-function clusterEdges(values, tolerance) {
+/*
+  Financial reports are highly repetitive.
+
+  The important signal is not every individual cell boundary.
+  It is the repeated horizontal position of numbers.
+
+  Most financial statements right-align their numbers, so the
+  RIGHT edge of numeric cells is a particularly useful anchor.
+
+  Example:
+
+       Revenue                 2025       2024       2023
+       Cost of sales           8,000      7,500      7,000
+       Gross profit            4,000      3,800      3,500
+
+  The right edges of 2025 / 2024 / 2023 and the values beneath
+  them repeatedly establish the numeric columns.
+
+  A single badly extracted number does NOT get to create a new
+  column.
+*/
+
+function clusterNumericAnchors(values, tolerance = 10) {
+  if (!values.length) return [];
+
   const sorted = [...values].sort((a, b) => a - b);
   const clusters = [];
 
   for (const value of sorted) {
     const last = clusters[clusters.length - 1];
 
-    if (last && value - last.max <= tolerance) {
+    if (
+      last &&
+      Math.abs(value - last.center) <= tolerance
+    ) {
       last.values.push(value);
-      last.max = value;
-      last.center =
-        last.values.reduce((sum, v) => sum + v, 0) / last.values.length;
-    } else {
-      clusters.push({ values: [value], max: value, center: value });
-    }
-  }
-
-  return clusters.map((c) => ({
-    center: c.center,
-    count: c.values.length,
-  }));
-}
-
-function buildColumnBoundaries(rows) {
-  const lefts = [];
-  const rights = [];
-
-  for (const row of rows) {
-    for (const cell of row) {
-      lefts.push(cell.x);
-      rights.push(cell.right ?? cell.x + cell.width);
-    }
-  }
-
-  if (!lefts.length) return [];
-
-  const EDGE_TOLERANCE = 6;
-
-  const leftClusters = clusterEdges(lefts, EDGE_TOLERANCE).map((c) => ({
-    ...c,
-  }));
-
-  const rightClusters = clusterEdges(rights, EDGE_TOLERANCE).map((c) => ({
-    ...c,
-  }));
-
-  const allEdges = [...leftClusters, ...rightClusters].sort(
-    (a, b) => a.center - b.center,
-  );
-
-  const merged = [];
-
-  for (const edge of allEdges) {
-    const last = merged[merged.length - 1];
-
-    if (last && Math.abs(edge.center - last.center) <= EDGE_TOLERANCE) {
-      const totalCount = last.count + edge.count;
 
       last.center =
-        (last.center * last.count + edge.center * edge.count) / totalCount;
-
-      last.count = totalCount;
+        last.values.reduce(
+          (sum, current) => sum + current,
+          0,
+        ) / last.values.length;
     } else {
-      merged.push({
-        center: edge.center,
-        count: edge.count,
+      clusters.push({
+        values: [value],
+        center: value,
       });
     }
   }
 
-  return merged.sort((a, b) => a.center - b.center);
+  return clusters.map((cluster) => ({
+    center: cluster.center,
+    support: cluster.values.length,
+  }));
 }
 
-function buildColumnsFromBoundaries(boundaries, rowCount) {
-  if (boundaries.length < 2) return [];
+/*
+  Some PDF files have slightly different x positions for
+  numbers in different rows because of font rendering.
 
-  const minSupport = Math.max(2, Math.ceil(rowCount * 0.12));
+  We therefore use several signals:
 
-  const filtered = boundaries.filter(
-    (b, i) => i === 0 || i === boundaries.length - 1 || b.count >= minSupport,
+    1. numeric right edge
+    2. numeric center
+    3. repeated support across rows
+
+  Right-edge clusters are the primary anchors.
+*/
+
+function getNumericCells(rows) {
+  const numericCells = [];
+
+  for (let rowIndex = 0; rowIndex < rows.length; rowIndex++) {
+    for (const cell of rows[rowIndex]) {
+      if (!isNumericText(cell.text)) {
+        continue;
+      }
+
+      const right =
+        cell.right ??
+        cell.x + cell.width;
+
+      const center =
+        cell.x + cell.width / 2;
+
+      numericCells.push({
+        rowIndex,
+        cell,
+        right,
+        center,
+      });
+    }
+  }
+
+  return numericCells;
+}
+
+function buildNumericColumns(rows) {
+  const numericCells = getNumericCells(rows);
+
+  if (!numericCells.length) {
+    return [];
+  }
+
+  /*
+    Right-edge clustering is the main method.
+  */
+  const rightClusters =
+    clusterNumericAnchors(
+      numericCells.map((item) => item.right),
+      10,
+    );
+
+  /*
+    Ignore completely isolated numeric positions when there
+    is enough evidence for a repeated table structure.
+
+    We still allow support of 1 when the entire table is tiny.
+  */
+  const rowCount = rows.length;
+
+  const minimumSupport =
+    rowCount >= 8
+      ? 2
+      : 1;
+
+  let anchors = rightClusters.filter(
+    (cluster) =>
+      cluster.support >= minimumSupport,
   );
 
-  const usable = filtered.length >= 2 ? filtered : boundaries;
+  /*
+    If filtering removed too much, fall back to all clusters.
+  */
+  if (anchors.length < 2) {
+    anchors = rightClusters;
+  }
 
-  const columns = [];
+  /*
+    Sort left-to-right.
+  */
+  anchors.sort(
+    (a, b) => a.center - b.center,
+  );
 
-  for (let i = 0; i < usable.length - 1; i++) {
-    const left = usable[i].center;
-    const right = usable[i + 1].center;
+  /*
+    Remove duplicate / near-identical anchors.
+  */
+  const cleaned = [];
 
-    if (right - left < 4) continue;
+  for (const anchor of anchors) {
+    const previous =
+      cleaned[cleaned.length - 1];
+
+    if (
+      previous &&
+      Math.abs(
+        anchor.center -
+          previous.center,
+      ) <= 12
+    ) {
+      const totalSupport =
+        previous.support +
+        anchor.support;
+
+      previous.center =
+        (
+          previous.center *
+            previous.support +
+          anchor.center *
+            anchor.support
+        ) / totalSupport;
+
+      previous.support = totalSupport;
+    } else {
+      cleaned.push({
+        center: anchor.center,
+        support: anchor.support,
+      });
+    }
+  }
+
+  /*
+    A financial table normally has sequential numeric columns.
+
+    If there are large gaps, we do NOT manufacture columns.
+    We only use positions that are actually supported by the PDF.
+  */
+  return cleaned;
+}
+
+/*
+  Convert numeric anchors into column objects.
+
+  Column 0 is reserved for the textual label area.
+
+  Numeric columns are represented by their anchor x-position.
+*/
+function buildColumns(rows) {
+  const numericAnchors =
+    buildNumericColumns(rows);
+
+  if (!numericAnchors.length) {
+    return [];
+  }
+
+  const columns = [
+    {
+      type: "label",
+      index: 0,
+      center: 0,
+      left: -Infinity,
+      right:
+        numericAnchors[0].center,
+    },
+  ];
+
+  for (
+    let i = 0;
+    i < numericAnchors.length;
+    i++
+  ) {
+    const current =
+      numericAnchors[i];
+
+    const previous =
+      numericAnchors[i - 1];
+
+    const next =
+      numericAnchors[i + 1];
+
+    let left;
+
+    let right;
+
+    if (previous) {
+      left =
+        (
+          previous.center +
+          current.center
+        ) / 2;
+    } else {
+      left = -Infinity;
+    }
+
+    if (next) {
+      right =
+        (
+          current.center +
+          next.center
+        ) / 2;
+    } else {
+      right = Infinity;
+    }
 
     columns.push({
+      type: "numeric",
+      index: i + 1,
+      center: current.center,
       left,
       right,
-      center: (left + right) / 2,
+      support: current.support,
     });
   }
 
@@ -281,74 +501,681 @@ function buildColumnsFromBoundaries(boundaries, rowCount) {
 }
 
 /* ============================================================
-   ASSIGN CELLS TO COLUMNS
+   ROW STRUCTURE
 ============================================================ */
 
-function assignCellsToColumns(rows, columns) {
-  return rows.map((row) => {
-    const output = Array(columns.length).fill(null);
+/*
+  Assign a numeric cell to the numeric column whose established
+  anchor is closest to the cell's RIGHT edge.
 
-    const cells = [...row].sort((a, b) => a.x - b.x);
+  This is deliberately different from the old overlap method.
 
-    for (const cell of cells) {
-      const cellLeft = cell.x;
-      const cellRight = cell.right ?? cell.x + cell.width;
-      const cellCenter = (cellLeft + cellRight) / 2;
+  The established column wins.
 
-      let bestIndex = -1;
-      let bestOverlap = -Infinity;
+  Blank rows/cells do not affect the column structure.
+*/
 
-      for (let i = 0; i < columns.length; i++) {
-        const column = columns[i];
+function getNearestNumericColumn(
+  cell,
+  numericColumns,
+) {
+  if (!numericColumns.length) {
+    return -1;
+  }
 
-        const overlap =
-          Math.min(cellRight, column.right) - Math.max(cellLeft, column.left);
+  const right =
+    cell.right ??
+    cell.x + cell.width;
 
-        if (overlap > bestOverlap) {
-          bestOverlap = overlap;
-          bestIndex = i;
-        }
-      }
+  let bestIndex = -1;
+  let bestDistance = Infinity;
 
-      if (bestOverlap <= 0) {
-        let nearestIndex = -1;
-        let nearestDistance = Infinity;
+  for (
+    let i = 0;
+    i < numericColumns.length;
+    i++
+  ) {
+    const column =
+      numericColumns[i];
 
-        for (let i = 0; i < columns.length; i++) {
-          const distance = Math.abs(columns[i].center - cellCenter);
+    const distance =
+      Math.abs(
+        right - column.center,
+      );
 
-          if (distance < nearestDistance) {
-            nearestDistance = distance;
-            nearestIndex = i;
-          }
-        }
+    if (
+      distance < bestDistance
+    ) {
+      bestDistance = distance;
+      bestIndex = i;
+    }
+  }
 
-        bestIndex = nearestIndex;
-      }
+  return bestIndex;
+}
 
-      if (bestIndex === -1) continue;
+/*
+  When a numeric cell is slightly displaced, compare it with the
+  surrounding rows.
 
-      if (output[bestIndex]) {
-        const existing = output[bestIndex];
+  Example:
 
-        output[bestIndex] = {
-          text: `${existing.text} ${cell.text}`,
-          x: Math.min(existing.x, cell.x),
-          width:
-            Math.max(existing.x + existing.width, cell.x + cell.width) -
-            Math.min(existing.x, cell.x),
-        };
-      } else {
-        output[bestIndex] = {
-          text: cell.text,
-          x: cell.x,
-          width: cell.width,
-        };
+       row above     2025   2024   2023
+       current       value
+       row below     2025   2024   2023
+
+  If the current value is closer to the 2024 position because of
+  PDF extraction noise, but the neighbouring rows clearly use
+  2025 at that position, the established sequence wins.
+*/
+
+function getNeighborColumnEvidence(
+  assignments,
+  rowIndex,
+  columnIndex,
+) {
+  let evidence = 0;
+
+  const previous =
+    assignments[rowIndex - 1];
+
+  const next =
+    assignments[rowIndex + 1];
+
+  if (
+    previous &&
+    previous.some(
+      (item) =>
+        item.numericColumn ===
+        columnIndex,
+    )
+  ) {
+    evidence += 1;
+  }
+
+  if (
+    next &&
+    next.some(
+      (item) =>
+        item.numericColumn ===
+        columnIndex,
+    )
+  ) {
+    evidence += 1;
+  }
+
+  return evidence;
+}
+
+/*
+  Correct obvious one-column shifts.
+
+  Important:
+
+  We DO NOT move every number toward the left.
+
+  We only move a number when:
+
+    - its current position is weak
+    - another established column is nearby
+    - that target column has repeated support
+    - the target is supported by neighbouring rows
+    - the target column is empty on the current row
+
+  This means normal sparse financial rows remain sparse.
+*/
+
+function repairNumericAssignments(
+  assignments,
+  numericColumns,
+) {
+  if (
+    !assignments.length ||
+    numericColumns.length <= 1
+  ) {
+    return assignments;
+  }
+
+  const rowCount =
+    assignments.length;
+
+  const support =
+    Array(numericColumns.length).fill(0);
+
+  /*
+    Measure support using distinct rows.
+  */
+  for (const row of assignments) {
+    const seen = new Set();
+
+    for (const item of row) {
+      if (
+        item.numericColumn !== null &&
+        item.numericColumn >= 0
+      ) {
+        seen.add(
+          item.numericColumn,
+        );
       }
     }
 
-    return output;
-  });
+    for (const column of seen) {
+      support[column] += 1;
+    }
+  }
+
+  /*
+    Copy the original structure.
+
+    Neighbour evidence should come from the original PDF
+    reconstruction, not from corrections we make later.
+  */
+  const original =
+    assignments.map((row) =>
+      row.map((item) => ({
+        ...item,
+      })),
+    );
+
+  const repaired =
+    assignments.map((row) =>
+      row.map((item) => ({
+        ...item,
+      })),
+    );
+
+  /*
+    Occupancy is mutable because after moving a value we need
+    to prevent another value from moving into the same cell.
+  */
+  const occupied =
+    repaired.map(
+      (row) =>
+        new Set(
+          row
+            .filter(
+              (item) =>
+                item.numericColumn !== null &&
+                item.numericColumn >= 0,
+            )
+            .map(
+              (item) =>
+                item.numericColumn,
+            ),
+        ),
+    );
+
+  /*
+    Strong structural support.
+
+    A column appearing in 20%+ of rows is normally meaningful,
+    but we always require at least 3 rows for larger selections.
+  */
+  const strongSupport =
+    Math.max(
+      3,
+      Math.ceil(rowCount * 0.2),
+    );
+
+  /*
+    Typical spacing between established numeric columns.
+  */
+  const gaps = [];
+
+  for (
+    let i = 1;
+    i < numericColumns.length;
+    i++
+  ) {
+    const gap =
+      numericColumns[i].center -
+      numericColumns[i - 1].center;
+
+    if (gap > 5) {
+      gaps.push(gap);
+    }
+  }
+
+  const typicalSpacing =
+    median(gaps) || 40;
+
+  /*
+    Only repair local shifts.
+
+    If something is two or three columns away, it is much more
+    likely to be a genuinely different structure.
+  */
+  const maxShift =
+    typicalSpacing * 1.25;
+
+  for (
+    let rowIndex = 0;
+    rowIndex < repaired.length;
+    rowIndex++
+  ) {
+    const row =
+      repaired[rowIndex];
+
+    for (
+      let itemIndex = 0;
+      itemIndex < row.length;
+      itemIndex++
+    ) {
+      const assignment =
+        row[itemIndex];
+
+      if (
+        !isNumericText(
+          assignment.cell.text,
+        )
+      ) {
+        continue;
+      }
+
+      const source =
+        assignment.numericColumn;
+
+      if (
+        source === null ||
+        source < 0
+      ) {
+        continue;
+      }
+
+      const sourceSupport =
+        support[source];
+
+      const sourceNeighbors =
+        getNeighborColumnEvidence(
+          original,
+          rowIndex,
+          source,
+        );
+
+      /*
+        If the current column is already repeatedly established
+        and neighbouring rows agree with it, there is no reason
+        to move the value.
+      */
+      if (
+        sourceSupport >=
+          strongSupport &&
+        sourceNeighbors >= 1
+      ) {
+        continue;
+      }
+
+      const cellRight =
+        assignment.cell.right ??
+        assignment.cell.x +
+          assignment.cell.width;
+
+      let bestTarget = -1;
+      let bestScore = -Infinity;
+
+      for (
+        let target = 0;
+        target <
+        numericColumns.length;
+        target++
+      ) {
+        if (target === source) {
+          continue;
+        }
+
+        /*
+          Never overwrite another number on the same row.
+        */
+        if (
+          occupied[rowIndex].has(
+            target,
+          )
+        ) {
+          continue;
+        }
+
+        const targetSupport =
+          support[target];
+
+        /*
+          The target needs real repeated evidence.
+        */
+        if (
+          targetSupport <
+          strongSupport
+        ) {
+          continue;
+        }
+
+        /*
+          It should be materially stronger than the current
+          position. This protects sparse legitimate columns.
+        */
+        if (
+          targetSupport <
+          sourceSupport + 2
+        ) {
+          continue;
+        }
+
+        const distance =
+          Math.abs(
+            cellRight -
+              numericColumns[
+                target
+              ].center,
+          );
+
+        if (
+          distance >
+          maxShift
+        ) {
+          continue;
+        }
+
+        const neighborEvidence =
+          getNeighborColumnEvidence(
+            original,
+            rowIndex,
+            target,
+          );
+
+        /*
+          Target scoring:
+
+          repeated support is the main signal
+          neighbouring rows are stronger evidence
+          left-shift gets a small preference because this is
+          the common PDF extraction error we are correcting
+        */
+        let score =
+          targetSupport * 2 +
+          neighborEvidence * 8 -
+          (distance /
+            typicalSpacing) *
+            2;
+
+        if (
+          target < source
+        ) {
+          score += 3;
+        }
+
+        if (
+          neighborEvidence ===
+          2
+        ) {
+          score += 5;
+        }
+
+        /*
+          Compare against keeping the current position.
+        */
+        const sourceScore =
+          sourceSupport * 2 +
+          sourceNeighbors * 8;
+
+        /*
+          Require meaningful evidence before changing anything.
+        */
+        if (
+          score <=
+          sourceScore + 5
+        ) {
+          continue;
+        }
+
+        if (
+          score > bestScore
+        ) {
+          bestScore = score;
+          bestTarget = target;
+        }
+      }
+
+      if (
+        bestTarget === -1
+      ) {
+        continue;
+      }
+
+      /*
+        Move the value.
+
+        The original structural evidence is not modified, so
+        later repairs cannot create fake evidence for themselves.
+      */
+      occupied[rowIndex].delete(
+        source,
+      );
+
+      occupied[rowIndex].add(
+        bestTarget,
+      );
+
+      assignment.numericColumn =
+        bestTarget;
+    }
+  }
+
+  return repaired;
+}
+
+/* ============================================================
+   TABLE ASSIGNMENT
+============================================================ */
+
+function assignCellsToColumns(
+  rows,
+  columns,
+) {
+  if (
+    !rows.length ||
+    !columns.length
+  ) {
+    return rows.map((row) =>
+      row.map((cell) => ({
+        text: cell.text,
+        x: cell.x,
+        width: cell.width,
+      })),
+    );
+  }
+
+  /*
+    Column 0 is always the textual label column.
+    Everything numeric is assigned to one of the established
+    numeric columns.
+  */
+  const numericColumns =
+    columns.filter(
+      (column) =>
+        column.type ===
+        "numeric",
+    );
+
+  if (!numericColumns.length) {
+    return rows.map((row) =>
+      row.map((cell) => ({
+        text: cell.text,
+        x: cell.x,
+        width: cell.width,
+      })),
+    );
+  }
+
+  /*
+    Initial assignment.
+
+    Text stays on the left.
+
+    Numeric cells are mapped to the nearest established
+    numeric anchor.
+  */
+  const assignments =
+    rows.map((row) => {
+      const output = [];
+
+      for (const cell of row) {
+        if (
+          isNumericText(cell.text)
+        ) {
+          const numericColumn =
+            getNearestNumericColumn(
+              cell,
+              numericColumns,
+            );
+
+          output.push({
+            cell,
+            numericColumn,
+          });
+        } else {
+          output.push({
+            cell,
+            numericColumn: null,
+          });
+        }
+      }
+
+      return output;
+    });
+
+  /*
+    Structural correction.
+
+    This is where we tolerate blanks and use the repeated
+    vertical pattern of the report.
+  */
+  const repaired =
+    repairNumericAssignments(
+      assignments,
+      numericColumns,
+    );
+
+  /*
+    Build rectangular output.
+
+    Column 0 = labels/text.
+
+    Column 1+ = established numeric columns.
+  */
+  return repaired.map(
+    (row) => {
+      const output = Array(
+        numericColumns.length + 1,
+      ).fill(null);
+
+      /*
+        All text fragments belong to the label column.
+      */
+      const textCells =
+        row.filter(
+          (item) =>
+            item.numericColumn ===
+            null,
+        );
+
+      if (textCells.length) {
+        const first =
+          textCells[0];
+
+        let left = first.cell.x;
+
+        let right =
+          first.cell.x +
+          first.cell.width;
+
+        let text =
+          first.cell.text;
+
+        for (
+          let i = 1;
+          i < textCells.length;
+          i++
+        ) {
+          const current =
+            textCells[i].cell;
+
+          text += ` ${current.text}`;
+
+          left = Math.min(
+            left,
+            current.x,
+          );
+
+          right = Math.max(
+            right,
+            current.x +
+              current.width,
+          );
+        }
+
+        output[0] = {
+          text,
+          x: left,
+          width: right - left,
+        };
+      }
+
+      /*
+        Numeric values occupy their established column.
+      */
+      for (const assignment of row) {
+        if (
+          assignment.numericColumn ===
+          null
+        ) {
+          continue;
+        }
+
+        const target =
+          assignment.numericColumn +
+          1;
+
+        const cell =
+          assignment.cell;
+
+        if (!output[target]) {
+          output[target] = {
+            text: cell.text,
+            x: cell.x,
+            width: cell.width,
+          };
+        } else {
+          /*
+            This should be rare, but if two PDF fragments land
+            in the same established column, preserve both.
+          */
+          const existing =
+            output[target];
+
+          const left =
+            Math.min(
+              existing.x,
+              cell.x,
+            );
+
+          const right =
+            Math.max(
+              existing.x +
+                existing.width,
+              cell.x +
+                cell.width,
+            );
+
+          output[target] = {
+            text: `${existing.text} ${cell.text}`,
+            x: left,
+            width:
+              right - left,
+          };
+        }
+      }
+
+      return output;
+    },
+  );
 }
 
 /* ============================================================
@@ -358,25 +1185,49 @@ function assignCellsToColumns(rows, columns) {
 function buildCells(items) {
   if (!items.length) return [];
 
-  const rawRows = buildRows(items);
-  const mergedRows = rawRows.map(mergeRowFragments);
+  const rawRows =
+    buildRows(items);
 
-  if (!mergedRows.length) return [];
+  const mergedRows =
+    rawRows.map(
+      mergeRowFragments,
+    );
 
-  const boundaries = buildColumnBoundaries(mergedRows);
-  const columns = buildColumnsFromBoundaries(boundaries, mergedRows.length);
+  if (!mergedRows.length) {
+    return [];
+  }
 
-  if (columns.length <= 1) {
-    return mergedRows.map((row) =>
-      row.map((cell) => ({
-        text: cell.text,
-        x: cell.x,
-        width: cell.width,
-      })),
+  /*
+    New table reconstruction.
+
+    We no longer build columns from every PDF text edge.
+
+    Instead:
+
+      text → label column
+      repeated numeric positions → numeric columns
+      blank → blank
+  */
+  const columns =
+    buildColumns(mergedRows);
+
+  if (
+    columns.length <= 1
+  ) {
+    return mergedRows.map(
+      (row) =>
+        row.map((cell) => ({
+          text: cell.text,
+          x: cell.x,
+          width: cell.width,
+        })),
     );
   }
 
-  return assignCellsToColumns(mergedRows, columns).map((row) =>
+  return assignCellsToColumns(
+    mergedRows,
+    columns,
+  ).map((row) =>
     row.map((cell) =>
       cell
         ? {
@@ -398,11 +1249,18 @@ function buildCells(items) {
 ============================================================ */
 
 function convertItemsToExcel(items) {
-  const rows = buildCells(items);
+  const rows =
+    buildCells(items);
 
   return rows
     .map((row) =>
-      row.map((cell) => normalizeFinancialValue(cell?.text || "")).join("\t"),
+      row
+        .map((cell) =>
+          normalizeFinancialValue(
+            cell?.text || "",
+          ),
+        )
+        .join("\t"),
     )
     .join("\n");
 }
@@ -412,82 +1270,157 @@ function convertItemsToExcel(items) {
 ============================================================ */
 
 function App() {
-  const [pdf, setPdf] = useState(null);
-  const [fileName, setFileName] = useState("");
-  const [pageNumber, setPageNumber] = useState(1);
-  const [numPages, setNumPages] = useState(0);
-  const [viewMode, setViewMode] = useState("continuous");
-  const [selectionMode, setSelectionMode] = useState(false);
-  const [zoom, setZoom] = useState(1);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState("");
-  const [pageRatio, setPageRatio] = useState(1.414);
+  const [pdf, setPdf] =
+    useState(null);
 
-  const pageCacheRef = useRef(new Map());
-  const pageTextCacheRef = useRef(new Map());
-  const pageDataCacheRef = useRef(new Map());
-  const renderedPageCacheRef = useRef(new Map());
-  const renderPromiseCacheRef = useRef(new Map());
-  const renderTaskCacheRef = useRef(new Map());
-  const documentVersionRef = useRef(0);
+  const [fileName, setFileName] =
+    useState("");
 
-  const [selection, setSelection] = useState(null);
-  const [dragging, setDragging] = useState(false);
-  const dragStartRef = useRef(null);
+  const [pageNumber, setPageNumber] =
+    useState(1);
 
-  const [copyMessage, setCopyMessage] = useState("");
-  const [copyState, setCopyState] = useState("idle");
-  const [toolbarPinned, setToolbarPinned] = useState(false);
+  const [numPages, setNumPages] =
+    useState(0);
 
-  const fileInputRef = useRef(null);
-  const viewerRef = useRef(null);
-  const singleCanvasRef = useRef(null);
-  const renderTokenRef = useRef(0);
-  const scrollFrameRef = useRef(null);
-  const lastScrollPageRef = useRef(1);
+  const [viewMode, setViewMode] =
+    useState("continuous");
 
-  const [singlePageData, setSinglePageData] = useState(null);
+  const [
+    selectionMode,
+    setSelectionMode,
+  ] = useState(false);
 
-  const copyMessageTimerRef = useRef(null);
-  const copyStateTimerRef = useRef(null);
+  const [zoom, setZoom] =
+    useState(1);
 
-  const pageWidth = DEFAULT_PAGE_WIDTH * zoom;
-  const pageHeight = pageWidth * pageRatio;
+  const [loading, setLoading] =
+    useState(false);
+
+  const [error, setError] =
+    useState("");
+
+  const [pageRatio, setPageRatio] =
+    useState(1.414);
+
+  const pageCacheRef =
+    useRef(new Map());
+
+  const pageTextCacheRef =
+    useRef(new Map());
+
+  const pageDataCacheRef =
+    useRef(new Map());
+
+  const renderedPageCacheRef =
+    useRef(new Map());
+
+  const renderPromiseCacheRef =
+    useRef(new Map());
+
+  const renderTaskCacheRef =
+    useRef(new Map());
+
+  const documentVersionRef =
+    useRef(0);
+
+  const [selection, setSelection] =
+    useState(null);
+
+  const [dragging, setDragging] =
+    useState(false);
+
+  const dragStartRef =
+    useRef(null);
+
+  const [copyMessage, setCopyMessage] =
+    useState("");
+
+  const [copyState, setCopyState] =
+    useState("idle");
+
+  const [
+    toolbarPinned,
+    setToolbarPinned,
+  ] = useState(false);
+
+  const fileInputRef =
+    useRef(null);
+
+  const viewerRef =
+    useRef(null);
+
+  const singleCanvasRef =
+    useRef(null);
+
+  const renderTokenRef =
+    useRef(0);
+
+  const scrollFrameRef =
+    useRef(null);
+
+  const lastScrollPageRef =
+    useRef(1);
+
+  const [singlePageData, setSinglePageData] =
+    useState(null);
+
+  const copyMessageTimerRef =
+    useRef(null);
+
+  const copyStateTimerRef =
+    useRef(null);
+
+  const pageWidth =
+    DEFAULT_PAGE_WIDTH * zoom;
+
+  const pageHeight =
+    pageWidth * pageRatio;
 
   const documentHeight =
     numPages > 0
-      ? numPages * pageHeight + Math.max(0, numPages - 1) * PAGE_GAP
+      ? numPages * pageHeight +
+        Math.max(
+          0,
+          numPages - 1,
+        ) *
+          PAGE_GAP
       : pageHeight;
 
   /* ==========================================================
      CACHE CLEANUP
   ========================================================== */
 
-  const cancelRenderTasks = useCallback(() => {
-    for (const task of renderTaskCacheRef.current.values()) {
-      try {
-        task.cancel();
-      } catch {}
-    }
+  const cancelRenderTasks =
+    useCallback(() => {
+      for (const task of renderTaskCacheRef.current.values()) {
+        try {
+          task.cancel();
+        } catch {}
+      }
 
-    renderTaskCacheRef.current.clear();
-  }, []);
+      renderTaskCacheRef.current.clear();
+    }, []);
 
-  const clearRenderedPageCache = useCallback(() => {
-    cancelRenderTasks();
+  const clearRenderedPageCache =
+    useCallback(() => {
+      cancelRenderTasks();
 
-    for (const cached of renderedPageCacheRef.current.values()) {
-      try {
-        if (cached?.canvas && typeof cached.canvas.width === "number") {
-          cached.canvas.width = 1;
-          cached.canvas.height = 1;
-        }
-      } catch {}
-    }
+      for (const cached of renderedPageCacheRef.current.values()) {
+        try {
+          if (
+            cached?.canvas &&
+            typeof cached.canvas.width ===
+              "number"
+          ) {
+            cached.canvas.width = 1;
+            cached.canvas.height = 1;
+          }
+        } catch {}
+      }
 
-    renderedPageCacheRef.current.clear();
-    renderPromiseCacheRef.current.clear();
-  }, [cancelRenderTasks]);
+      renderedPageCacheRef.current.clear();
+      renderPromiseCacheRef.current.clear();
+    }, [cancelRenderTasks]);
 
   /* ==========================================================
      PDF EFFECTS
@@ -497,7 +1430,10 @@ function App() {
     if (!pdf) return;
 
     if (viewMode === "single") {
-      renderSinglePage(pageNumber, true);
+      renderSinglePage(
+        pageNumber,
+        true,
+      );
     }
   }, [pdf]);
 
@@ -505,28 +1441,48 @@ function App() {
     if (!pdf) return;
 
     if (viewMode === "single") {
-      renderSinglePage(pageNumber, false);
+      renderSinglePage(
+        pageNumber,
+        false,
+      );
     }
-  }, [pageNumber, viewMode, zoom]);
+  }, [
+    pageNumber,
+    viewMode,
+    zoom,
+  ]);
 
   useEffect(() => {
     if (!pdf) return;
 
     clearRenderedPageCache();
-  }, [zoom, clearRenderedPageCache]);
+  }, [
+    zoom,
+    clearRenderedPageCache,
+  ]);
 
   useEffect(() => {
     return () => {
       if (scrollFrameRef.current) {
-        cancelAnimationFrame(scrollFrameRef.current);
+        cancelAnimationFrame(
+          scrollFrameRef.current,
+        );
       }
 
-      if (copyMessageTimerRef.current) {
-        clearTimeout(copyMessageTimerRef.current);
+      if (
+        copyMessageTimerRef.current
+      ) {
+        clearTimeout(
+          copyMessageTimerRef.current,
+        );
       }
 
-      if (copyStateTimerRef.current) {
-        clearTimeout(copyStateTimerRef.current);
+      if (
+        copyStateTimerRef.current
+      ) {
+        clearTimeout(
+          copyStateTimerRef.current,
+        );
       }
 
       clearRenderedPageCache();
@@ -544,104 +1500,193 @@ function App() {
   ========================================================== */
 
   useEffect(() => {
-    if (!pdf || viewMode !== "continuous") return;
+    if (
+      !pdf ||
+      viewMode !== "continuous"
+    ) {
+      return;
+    }
 
     const handleScroll = () => {
-      if (scrollFrameRef.current) return;
+      if (scrollFrameRef.current) {
+        return;
+      }
 
-      scrollFrameRef.current = requestAnimationFrame(() => {
-        scrollFrameRef.current = null;
+      scrollFrameRef.current =
+        requestAnimationFrame(() => {
+          scrollFrameRef.current =
+            null;
 
-        const viewer = viewerRef.current;
-        if (!viewer) return;
+          const viewer =
+            viewerRef.current;
 
-        const viewerTop = viewer.getBoundingClientRect().top + window.scrollY;
+          if (!viewer) return;
 
-        const readingPoint = window.scrollY + window.innerHeight * 0.42;
+          const viewerTop =
+            viewer.getBoundingClientRect()
+              .top +
+            window.scrollY;
 
-        const relativeReadingPoint = readingPoint - viewerTop;
+          const readingPoint =
+            window.scrollY +
+            window.innerHeight *
+              0.42;
 
-        const slotHeight = pageHeight + PAGE_GAP;
+          const relativeReadingPoint =
+            readingPoint -
+            viewerTop;
 
-        const nextPage = clamp(
-          Math.floor(Math.max(0, relativeReadingPoint - 28) / slotHeight) + 1,
-          1,
-          numPages,
-        );
+          const slotHeight =
+            pageHeight +
+            PAGE_GAP;
 
-        if (nextPage !== lastScrollPageRef.current) {
-          lastScrollPageRef.current = nextPage;
-          setPageNumber(nextPage);
-        }
-      });
+          const nextPage = clamp(
+            Math.floor(
+              Math.max(
+                0,
+                relativeReadingPoint -
+                  28,
+              ) /
+                slotHeight,
+            ) + 1,
+            1,
+            numPages,
+          );
+
+          if (
+            nextPage !==
+            lastScrollPageRef.current
+          ) {
+            lastScrollPageRef.current =
+              nextPage;
+
+            setPageNumber(
+              nextPage,
+            );
+          }
+        });
     };
 
-    window.addEventListener("scroll", handleScroll, {
-      passive: true,
-    });
+    window.addEventListener(
+      "scroll",
+      handleScroll,
+      {
+        passive: true,
+      },
+    );
 
     handleScroll();
 
     return () => {
-      window.removeEventListener("scroll", handleScroll);
+      window.removeEventListener(
+        "scroll",
+        handleScroll,
+      );
 
-      if (scrollFrameRef.current) {
-        cancelAnimationFrame(scrollFrameRef.current);
-        scrollFrameRef.current = null;
+      if (
+        scrollFrameRef.current
+      ) {
+        cancelAnimationFrame(
+          scrollFrameRef.current,
+        );
+
+        scrollFrameRef.current =
+          null;
       }
     };
-  }, [pdf, viewMode, pageHeight, numPages]);
+  }, [
+    pdf,
+    viewMode,
+    pageHeight,
+    numPages,
+  ]);
 
   /* ==========================================================
      PAGE CACHE
   ========================================================== */
 
-  const getPage = useCallback(
-    async (pageNum) => {
-      if (!pdf) return null;
+  const getPage =
+    useCallback(
+      async (pageNum) => {
+        if (!pdf) return null;
 
-      const cached = pageCacheRef.current.get(pageNum);
-      if (cached) return cached;
+        const cached =
+          pageCacheRef.current.get(
+            pageNum,
+          );
 
-      const page = await pdf.getPage(pageNum);
-      const viewport = page.getViewport({ scale: 1 });
+        if (cached) {
+          return cached;
+        }
 
-      const result = {
-        page,
-        width: viewport.width,
-        height: viewport.height,
-        ratio: viewport.height / viewport.width,
-      };
+        const page =
+          await pdf.getPage(
+            pageNum,
+          );
 
-      pageCacheRef.current.set(pageNum, result);
+        const viewport =
+          page.getViewport({
+            scale: 1,
+          });
 
-      return result;
-    },
-    [pdf],
-  );
+        const result = {
+          page,
+          width: viewport.width,
+          height: viewport.height,
+          ratio:
+            viewport.height /
+            viewport.width,
+        };
 
-  const getPageText = useCallback(
-    async (pageNum) => {
-      const cached = pageTextCacheRef.current.get(pageNum);
-      if (cached) return cached;
+        pageCacheRef.current.set(
+          pageNum,
+          result,
+        );
 
-      const result = await getPage(pageNum);
-      if (!result) return [];
+        return result;
+      },
+      [pdf],
+    );
 
-      try {
-        const content = await result.page.getTextContent();
-        const items = normalizeItems(content.items);
+  const getPageText =
+    useCallback(
+      async (pageNum) => {
+        const cached =
+          pageTextCacheRef.current.get(
+            pageNum,
+          );
 
-        pageTextCacheRef.current.set(pageNum, items);
+        if (cached) {
+          return cached;
+        }
 
-        return items;
-      } catch (err) {
-        console.error(err);
-        return [];
-      }
-    },
-    [getPage],
-  );
+        const result =
+          await getPage(pageNum);
+
+        if (!result) return [];
+
+        try {
+          const content =
+            await result.page.getTextContent();
+
+          const items =
+            normalizeItems(
+              content.items,
+            );
+
+          pageTextCacheRef.current.set(
+            pageNum,
+            items,
+          );
+
+          return items;
+        } catch (err) {
+          console.error(err);
+          return [];
+        }
+      },
+      [getPage],
+    );
 
   /* ==========================================================
      OPEN PDF
@@ -675,29 +1720,52 @@ function App() {
     }
 
     try {
-      const buffer = await file.arrayBuffer();
-      const loadingTask = pdfjsLib.getDocument({ data: buffer });
-      const loadedPdf = await loadingTask.promise;
+      const buffer =
+        await file.arrayBuffer();
+
+      const loadingTask =
+        pdfjsLib.getDocument({
+          data: buffer,
+        });
+
+      const loadedPdf =
+        await loadingTask.promise;
 
       setPdf(loadedPdf);
       setFileName(file.name);
-      setNumPages(loadedPdf.numPages);
+      setNumPages(
+        loadedPdf.numPages,
+      );
 
       setPageNumber(1);
-      lastScrollPageRef.current = 1;
+      lastScrollPageRef.current =
+        1;
 
-      const firstPage = await loadedPdf.getPage(1);
-      const viewport = firstPage.getViewport({ scale: 1 });
-      const ratio = viewport.height / viewport.width;
+      const firstPage =
+        await loadedPdf.getPage(
+          1,
+        );
+
+      const viewport =
+        firstPage.getViewport({
+          scale: 1,
+        });
+
+      const ratio =
+        viewport.height /
+        viewport.width;
 
       setPageRatio(ratio);
 
-      pageCacheRef.current.set(1, {
-        page: firstPage,
-        width: viewport.width,
-        height: viewport.height,
-        ratio,
-      });
+      pageCacheRef.current.set(
+        1,
+        {
+          page: firstPage,
+          width: viewport.width,
+          height: viewport.height,
+          ratio,
+        },
+      );
 
       requestAnimationFrame(() => {
         window.scrollTo({
@@ -707,14 +1775,19 @@ function App() {
       });
     } catch (err) {
       console.error(err);
-      setError("Could not open this PDF.");
+      setError(
+        "Could not open this PDF.",
+      );
     } finally {
       setLoading(false);
     }
   }
 
-  function handleFileChange(event) {
-    const file = event.target.files?.[0];
+  function handleFileChange(
+    event,
+  ) {
+    const file =
+      event.target.files?.[0];
 
     if (file) {
       openFile(file);
@@ -729,7 +1802,15 @@ function App() {
 
   function changeZoom(delta) {
     setZoom((current) =>
-      clamp(Number((current + delta).toFixed(2)), MIN_ZOOM, MAX_ZOOM),
+      clamp(
+        Number(
+          (
+            current + delta
+          ).toFixed(2),
+        ),
+        MIN_ZOOM,
+        MAX_ZOOM,
+      ),
     );
   }
 
@@ -741,198 +1822,386 @@ function App() {
      OFFSCREEN PAGE RENDER
   ========================================================== */
 
-  const getRenderedPage = useCallback(
-    async (pageNum) => {
-      if (!pdf) return null;
+  const getRenderedPage =
+    useCallback(
+      async (pageNum) => {
+        if (!pdf) return null;
 
-      const documentVersion = documentVersionRef.current;
-      const cacheKey = `${pageNum}@${Math.round(pageWidth)}`;
+        const documentVersion =
+          documentVersionRef.current;
 
-      const cached = renderedPageCacheRef.current.get(cacheKey);
+        const cacheKey = `${pageNum}@${Math.round(
+          pageWidth,
+        )}`;
 
-      if (cached) return cached;
+        const cached =
+          renderedPageCacheRef.current.get(
+            cacheKey,
+          );
 
-      const existingPromise = renderPromiseCacheRef.current.get(cacheKey);
-
-      if (existingPromise) return existingPromise;
-
-      const renderPromise = (async () => {
-        const result = await getPage(pageNum);
-        if (!result) return null;
-
-        if (documentVersion !== documentVersionRef.current) {
-          return null;
+        if (cached) {
+          return cached;
         }
 
-        const scale = pageWidth / result.width;
-        const viewport = result.page.getViewport({ scale });
-        const outputScale = window.devicePixelRatio || 1;
+        const existingPromise =
+          renderPromiseCacheRef.current.get(
+            cacheKey,
+          );
 
-        const renderCanvas = document.createElement("canvas");
-
-        renderCanvas.width = Math.ceil(viewport.width * outputScale);
-
-        renderCanvas.height = Math.ceil(viewport.height * outputScale);
-
-        const context = renderCanvas.getContext("2d", { alpha: false });
-
-        if (!context) {
-          throw new Error("Could not create canvas context.");
+        if (existingPromise) {
+          return existingPromise;
         }
 
-        context.setTransform(outputScale, 0, 0, outputScale, 0, 0);
+        const renderPromise =
+          (async () => {
+            const result =
+              await getPage(
+                pageNum,
+              );
 
-        context.fillStyle = "#ffffff";
-        context.fillRect(0, 0, viewport.width, viewport.height);
+            if (!result) {
+              return null;
+            }
 
-        const task = result.page.render({
-          canvasContext: context,
-          viewport,
-        });
+            if (
+              documentVersion !==
+              documentVersionRef.current
+            ) {
+              return null;
+            }
 
-        renderTaskCacheRef.current.set(cacheKey, task);
+            const scale =
+              pageWidth /
+              result.width;
+
+            const viewport =
+              result.page.getViewport({
+                scale,
+              });
+
+            const outputScale =
+              window.devicePixelRatio ||
+              1;
+
+            const renderCanvas =
+              document.createElement(
+                "canvas",
+              );
+
+            renderCanvas.width =
+              Math.ceil(
+                viewport.width *
+                  outputScale,
+              );
+
+            renderCanvas.height =
+              Math.ceil(
+                viewport.height *
+                  outputScale,
+              );
+
+            const context =
+              renderCanvas.getContext(
+                "2d",
+                {
+                  alpha: false,
+                },
+              );
+
+            if (!context) {
+              throw new Error(
+                "Could not create canvas context.",
+              );
+            }
+
+            context.setTransform(
+              outputScale,
+              0,
+              0,
+              outputScale,
+              0,
+              0,
+            );
+
+            context.fillStyle =
+              "#ffffff";
+
+            context.fillRect(
+              0,
+              0,
+              viewport.width,
+              viewport.height,
+            );
+
+            const task =
+              result.page.render({
+                canvasContext:
+                  context,
+                viewport,
+              });
+
+            renderTaskCacheRef.current.set(
+              cacheKey,
+              task,
+            );
+
+            try {
+              await task.promise;
+            } finally {
+              if (
+                renderTaskCacheRef.current.get(
+                  cacheKey,
+                ) === task
+              ) {
+                renderTaskCacheRef.current.delete(
+                  cacheKey,
+                );
+              }
+            }
+
+            if (
+              documentVersion !==
+              documentVersionRef.current
+            ) {
+              return null;
+            }
+
+            const rendered = {
+              canvas:
+                renderCanvas,
+              viewport,
+              width:
+                viewport.width,
+              height:
+                viewport.height,
+            };
+
+            renderedPageCacheRef.current.set(
+              cacheKey,
+              rendered,
+            );
+
+            return rendered;
+          })();
+
+        renderPromiseCacheRef.current.set(
+          cacheKey,
+          renderPromise,
+        );
 
         try {
-          await task.promise;
+          return await renderPromise;
+        } catch (err) {
+          if (
+            err?.name !==
+            "RenderingCancelledException"
+          ) {
+            console.error(
+              `Page ${pageNum} render error`,
+              err,
+            );
+          }
+
+          return null;
         } finally {
-          if (renderTaskCacheRef.current.get(cacheKey) === task) {
-            renderTaskCacheRef.current.delete(cacheKey);
+          if (
+            renderPromiseCacheRef.current.get(
+              cacheKey,
+            ) === renderPromise
+          ) {
+            renderPromiseCacheRef.current.delete(
+              cacheKey,
+            );
           }
         }
-
-        if (documentVersion !== documentVersionRef.current) {
-          return null;
-        }
-
-        const rendered = {
-          canvas: renderCanvas,
-          viewport,
-          width: viewport.width,
-          height: viewport.height,
-        };
-
-        renderedPageCacheRef.current.set(cacheKey, rendered);
-
-        return rendered;
-      })();
-
-      renderPromiseCacheRef.current.set(cacheKey, renderPromise);
-
-      try {
-        return await renderPromise;
-      } catch (err) {
-        if (err?.name !== "RenderingCancelledException") {
-          console.error(`Page ${pageNum} render error`, err);
-        }
-
-        return null;
-      } finally {
-        if (renderPromiseCacheRef.current.get(cacheKey) === renderPromise) {
-          renderPromiseCacheRef.current.delete(cacheKey);
-        }
-      }
-    },
-    [pdf, pageWidth, getPage],
-  );
+      },
+      [
+        pdf,
+        pageWidth,
+        getPage,
+      ],
+    );
 
   /* ==========================================================
      PAINT PAGE
   ========================================================== */
 
-  const paintPageToCanvas = useCallback(
-    async (pageNum, canvas) => {
-      if (!canvas) return null;
+  const paintPageToCanvas =
+    useCallback(
+      async (
+        pageNum,
+        canvas,
+      ) => {
+        if (!canvas) {
+          return null;
+        }
 
-      const rendered = await getRenderedPage(pageNum);
+        const rendered =
+          await getRenderedPage(
+            pageNum,
+          );
 
-      if (!rendered) return null;
+        if (!rendered) {
+          return null;
+        }
 
-      const { canvas: sourceCanvas, viewport } = rendered;
+        const {
+          canvas: sourceCanvas,
+          viewport,
+        } = rendered;
 
-      const outputScale = window.devicePixelRatio || 1;
+        const outputScale =
+          window.devicePixelRatio ||
+          1;
 
-      canvas.width = Math.ceil(viewport.width * outputScale);
+        canvas.width =
+          Math.ceil(
+            viewport.width *
+              outputScale,
+          );
 
-      canvas.height = Math.ceil(viewport.height * outputScale);
+        canvas.height =
+          Math.ceil(
+            viewport.height *
+              outputScale,
+          );
 
-      canvas.style.width = `${viewport.width}px`;
+        canvas.style.width =
+          `${viewport.width}px`;
 
-      canvas.style.height = `${viewport.height}px`;
+        canvas.style.height =
+          `${viewport.height}px`;
 
-      const context = canvas.getContext("2d", { alpha: false });
+        const context =
+          canvas.getContext(
+            "2d",
+            {
+              alpha: false,
+            },
+          );
 
-      if (!context) return null;
+        if (!context) {
+          return null;
+        }
 
-      context.setTransform(outputScale, 0, 0, outputScale, 0, 0);
+        context.setTransform(
+          outputScale,
+          0,
+          0,
+          outputScale,
+          0,
+          0,
+        );
 
-      context.fillStyle = "#ffffff";
+        context.fillStyle =
+          "#ffffff";
 
-      context.fillRect(0, 0, viewport.width, viewport.height);
+        context.fillRect(
+          0,
+          0,
+          viewport.width,
+          viewport.height,
+        );
 
-      context.drawImage(
-        sourceCanvas,
-        0,
-        0,
-        sourceCanvas.width,
-        sourceCanvas.height,
-        0,
-        0,
-        viewport.width,
-        viewport.height,
-      );
+        context.drawImage(
+          sourceCanvas,
+          0,
+          0,
+          sourceCanvas.width,
+          sourceCanvas.height,
+          0,
+          0,
+          viewport.width,
+          viewport.height,
+        );
 
-      return rendered;
-    },
-    [getRenderedPage],
-  );
+        return rendered;
+      },
+      [getRenderedPage],
+    );
 
   /* ==========================================================
      SINGLE PAGE
   ========================================================== */
 
-  async function renderSinglePage(targetPage, showLoading) {
+  async function renderSinglePage(
+    targetPage,
+    showLoading,
+  ) {
     if (!pdf) return;
 
-    const canvas = singleCanvasRef.current;
+    const canvas =
+      singleCanvasRef.current;
 
     if (!canvas) return;
 
-    const token = ++renderTokenRef.current;
+    const token =
+      ++renderTokenRef.current;
 
     if (showLoading) {
       setLoading(true);
     }
 
     try {
-      const rendered = await paintPageToCanvas(targetPage, canvas);
+      const rendered =
+        await paintPageToCanvas(
+          targetPage,
+          canvas,
+        );
 
       if (!rendered) return;
 
-      if (token !== renderTokenRef.current) {
+      if (
+        token !==
+        renderTokenRef.current
+      ) {
         return;
       }
 
-      const items = await getPageText(targetPage);
+      const items =
+        await getPageText(
+          targetPage,
+        );
 
-      if (token !== renderTokenRef.current) {
+      if (
+        token !==
+        renderTokenRef.current
+      ) {
         return;
       }
 
-      const basePage = await getPage(targetPage);
+      const basePage =
+        await getPage(
+          targetPage,
+        );
 
       const data = {
-        pageNumber: targetPage,
+        pageNumber:
+          targetPage,
         items,
-        viewport: rendered.viewport,
-        baseWidth: basePage?.width || rendered.viewport.width,
-        baseHeight: basePage?.height || rendered.viewport.height,
+        viewport:
+          rendered.viewport,
+        baseWidth:
+          basePage?.width ||
+          rendered.viewport
+            .width,
+        baseHeight:
+          basePage?.height ||
+          rendered.viewport
+            .height,
       };
 
-      pageDataCacheRef.current.set(targetPage, data);
+      pageDataCacheRef.current.set(
+        targetPage,
+        data,
+      );
 
       setSinglePageData(data);
     } catch (err) {
-      if (err?.name !== "RenderingCancelledException") {
+      if (
+        err?.name !==
+        "RenderingCancelledException"
+      ) {
         console.error(err);
       }
     } finally {
@@ -946,61 +2215,128 @@ function App() {
      CONTINUOUS PAGE
   ========================================================== */
 
-  const renderContinuousPage = useCallback(
-    async (pageNum, canvas) => {
-      if (!pdf || !canvas) return null;
-
-      try {
-        const rendered = await paintPageToCanvas(pageNum, canvas);
-
-        if (!rendered) return null;
-
-        const items = await getPageText(pageNum);
-
-        const basePage = await getPage(pageNum);
-
-        const data = {
-          pageNumber: pageNum,
-          items,
-          viewport: rendered.viewport,
-          baseWidth: basePage?.width || rendered.viewport.width,
-          baseHeight: basePage?.height || rendered.viewport.height,
-        };
-
-        pageDataCacheRef.current.set(pageNum, data);
-
-        return data;
-      } catch (err) {
-        if (err?.name !== "RenderingCancelledException") {
-          console.error(`Page ${pageNum} render error`, err);
+  const renderContinuousPage =
+    useCallback(
+      async (
+        pageNum,
+        canvas,
+      ) => {
+        if (
+          !pdf ||
+          !canvas
+        ) {
+          return null;
         }
 
-        return null;
-      }
-    },
-    [pdf, paintPageToCanvas, getPageText, getPage],
-  );
+        try {
+          const rendered =
+            await paintPageToCanvas(
+              pageNum,
+              canvas,
+            );
+
+          if (!rendered) {
+            return null;
+          }
+
+          const items =
+            await getPageText(
+              pageNum,
+            );
+
+          const basePage =
+            await getPage(
+              pageNum,
+            );
+
+          const data = {
+            pageNumber:
+              pageNum,
+            items,
+            viewport:
+              rendered.viewport,
+            baseWidth:
+              basePage?.width ||
+              rendered.viewport
+                .width,
+            baseHeight:
+              basePage?.height ||
+              rendered.viewport
+                .height,
+          };
+
+          pageDataCacheRef.current.set(
+            pageNum,
+            data,
+          );
+
+          return data;
+        } catch (err) {
+          if (
+            err?.name !==
+            "RenderingCancelledException"
+          ) {
+            console.error(
+              `Page ${pageNum} render error`,
+              err,
+            );
+          }
+
+          return null;
+        }
+      },
+      [
+        pdf,
+        paintPageToCanvas,
+        getPageText,
+        getPage,
+      ],
+    );
 
   /* ==========================================================
      NAVIGATION
   ========================================================== */
 
-  function goToPage(nextPage) {
+  function goToPage(
+    nextPage,
+  ) {
     if (!pdf) return;
 
-    const target = clamp(nextPage, 1, numPages);
+    const target =
+      clamp(
+        nextPage,
+        1,
+        numPages,
+      );
 
-    setPageNumber(target);
-    lastScrollPageRef.current = target;
+    setPageNumber(
+      target,
+    );
 
-    if (viewMode === "continuous") {
-      const viewer = viewerRef.current;
+    lastScrollPageRef.current =
+      target;
+
+    if (
+      viewMode ===
+      "continuous"
+    ) {
+      const viewer =
+        viewerRef.current;
 
       if (viewer) {
-        const viewerTop = viewer.getBoundingClientRect().top + window.scrollY;
+        const viewerTop =
+          viewer.getBoundingClientRect()
+            .top +
+          window.scrollY;
 
         const targetTop =
-          viewerTop + 28 + (target - 1) * (pageHeight + PAGE_GAP);
+          viewerTop +
+          28 +
+          (target - 1) *
+            (
+              pageHeight +
+              PAGE_GAP
+            );
 
         window.scrollTo({
           top: targetTop,
@@ -1014,28 +2350,58 @@ function App() {
      COORDINATE CONVERSION
   ========================================================== */
 
-  function getPdfPoint(event, pageData, container) {
-    const rect = container.getBoundingClientRect();
+  function getPdfPoint(
+    event,
+    pageData,
+    container,
+  ) {
+    const rect =
+      container.getBoundingClientRect();
 
-    const baseWidth = pageData.baseWidth || pageData.viewport.width;
+    const baseWidth =
+      pageData.baseWidth ||
+      pageData.viewport.width;
 
-    const baseHeight = pageData.baseHeight || pageData.viewport.height;
+    const baseHeight =
+      pageData.baseHeight ||
+      pageData.viewport.height;
 
-    const screenX = event.clientX - rect.left;
+    const screenX =
+      event.clientX -
+      rect.left;
 
-    const screenY = event.clientY - rect.top;
+    const screenY =
+      event.clientY -
+      rect.top;
 
-    const scaleX = baseWidth / rect.width;
+    const scaleX =
+      baseWidth /
+      rect.width;
 
-    const scaleY = baseHeight / rect.height;
+    const scaleY =
+      baseHeight /
+      rect.height;
 
-    const x = screenX * scaleX;
-    const topY = screenY * scaleY;
-    const y = baseHeight - topY;
+    const x =
+      screenX * scaleX;
+
+    const topY =
+      screenY * scaleY;
+
+    const y =
+      baseHeight - topY;
 
     return {
-      x: clamp(x, 0, baseWidth),
-      y: clamp(y, 0, baseHeight),
+      x: clamp(
+        x,
+        0,
+        baseWidth,
+      ),
+      y: clamp(
+        y,
+        0,
+        baseHeight,
+      ),
     };
   }
 
@@ -1043,16 +2409,31 @@ function App() {
      RECTANGULAR SELECTION
   ========================================================== */
 
-  function beginSelection(event, targetPage, pageData, container) {
+  function beginSelection(
+    event,
+    targetPage,
+    pageData,
+    container,
+  ) {
     if (!selectionMode) return;
-    if (!pageData?.viewport) return;
+
+    if (!pageData?.viewport) {
+      return;
+    }
 
     event.preventDefault();
 
-    const point = getPdfPoint(event, pageData, container);
+    const point =
+      getPdfPoint(
+        event,
+        pageData,
+        container,
+      );
 
     try {
-      container.setPointerCapture(event.pointerId);
+      container.setPointerCapture(
+        event.pointerId,
+      );
     } catch {}
 
     setDragging(true);
@@ -1060,48 +2441,91 @@ function App() {
     dragStartRef.current = {
       x: point.x,
       y: point.y,
-      pageNumber: targetPage,
+      pageNumber:
+        targetPage,
     };
 
-    setPageNumber(targetPage);
-    lastScrollPageRef.current = targetPage;
+    setPageNumber(
+      targetPage,
+    );
+
+    lastScrollPageRef.current =
+      targetPage;
 
     setSelection({
       x: point.x,
       y: point.y,
       width: 0,
       height: 0,
-      pageNumber: targetPage,
+      pageNumber:
+        targetPage,
     });
   }
 
-  function updateSelection(event, targetPage, pageData, container) {
-    if (!selectionMode || !dragging || !dragStartRef.current) {
+  function updateSelection(
+    event,
+    targetPage,
+    pageData,
+    container,
+  ) {
+    if (
+      !selectionMode ||
+      !dragging ||
+      !dragStartRef.current
+    ) {
       return;
     }
 
-    const start = dragStartRef.current;
+    const start =
+      dragStartRef.current;
 
-    if (start.pageNumber !== targetPage) {
+    if (
+      start.pageNumber !==
+      targetPage
+    ) {
       return;
     }
 
-    const point = getPdfPoint(event, pageData, container);
+    const point =
+      getPdfPoint(
+        event,
+        pageData,
+        container,
+      );
 
-    const left = Math.min(start.x, point.x);
+    const left =
+      Math.min(
+        start.x,
+        point.x,
+      );
 
-    const right = Math.max(start.x, point.x);
+    const right =
+      Math.max(
+        start.x,
+        point.x,
+      );
 
-    const bottom = Math.min(start.y, point.y);
+    const bottom =
+      Math.min(
+        start.y,
+        point.y,
+      );
 
-    const top = Math.max(start.y, point.y);
+    const top =
+      Math.max(
+        start.y,
+        point.y,
+      );
 
     setSelection({
       x: left,
       y: bottom,
-      width: right - left,
-      height: top - bottom,
-      pageNumber: targetPage,
+      width:
+        right - left,
+      height:
+        top - bottom,
+      pageNumber:
+        targetPage,
     });
   }
 
@@ -1109,7 +2533,8 @@ function App() {
     if (!dragging) return;
 
     setDragging(false);
-    dragStartRef.current = null;
+    dragStartRef.current =
+      null;
   }
 
   /* ==========================================================
@@ -1117,35 +2542,61 @@ function App() {
   ========================================================== */
 
   function itemsInsideSelection() {
-    if (!selection) return [];
+    if (!selection) {
+      return [];
+    }
 
-    const pageData = pageDataCacheRef.current.get(selection.pageNumber);
+    const pageData =
+      pageDataCacheRef.current.get(
+        selection.pageNumber,
+      );
 
     const items =
-      pageData?.items || pageTextCacheRef.current.get(selection.pageNumber);
-
-    if (!items) return [];
-
-    const right = selection.x + selection.width;
-
-    const top = selection.y + selection.height;
-
-    const bottom = selection.y;
-
-    return items.filter((item) => {
-      const itemRight = item.x + item.width;
-
-      const itemTop = item.y + item.height;
-
-      const itemBottom = item.y;
-
-      return (
-        item.x < right &&
-        itemRight > selection.x &&
-        itemBottom < top &&
-        itemTop > bottom
+      pageData?.items ||
+      pageTextCacheRef.current.get(
+        selection.pageNumber,
       );
-    });
+
+    if (!items) {
+      return [];
+    }
+
+    const right =
+      selection.x +
+      selection.width;
+
+    const top =
+      selection.y +
+      selection.height;
+
+    const bottom =
+      selection.y;
+
+    return items.filter(
+      (item) => {
+        const itemRight =
+          item.x +
+          item.width;
+
+        const itemTop =
+          item.y +
+          item.height;
+
+        const itemBottom =
+          item.y;
+
+        return (
+          item.x <
+            right &&
+          itemRight >
+            selection.x &&
+          itemBottom <
+            top &&
+          itemTop >
+            bottom
+        );
+      },
+    );
   }
 
   /* ==========================================================
@@ -1155,7 +2606,8 @@ function App() {
   function activateSelectionMode() {
     setSelection(null);
     setDragging(false);
-    dragStartRef.current = null;
+    dragStartRef.current =
+      null;
     setSelectionMode(true);
   }
 
@@ -1166,7 +2618,8 @@ function App() {
 
   function clearSelection() {
     setSelection(null);
-    dragStartRef.current = null;
+    dragStartRef.current =
+      null;
     setDragging(false);
   }
 
@@ -1174,47 +2627,72 @@ function App() {
      COPY UI
   ========================================================== */
 
-  function showCopyMessage(message) {
+  function showCopyMessage(
+    message,
+  ) {
     setCopyMessage(message);
 
-    if (copyMessageTimerRef.current) {
-      clearTimeout(copyMessageTimerRef.current);
+    if (
+      copyMessageTimerRef.current
+    ) {
+      clearTimeout(
+        copyMessageTimerRef.current,
+      );
     }
 
-    copyMessageTimerRef.current = setTimeout(() => {
-      setCopyMessage("");
-    }, 1800);
+    copyMessageTimerRef.current =
+      setTimeout(() => {
+        setCopyMessage("");
+      }, 1800);
   }
 
-  function showCopyState(state) {
+  function showCopyState(
+    state,
+  ) {
     setCopyState(state);
 
-    if (copyStateTimerRef.current) {
-      clearTimeout(copyStateTimerRef.current);
+    if (
+      copyStateTimerRef.current
+    ) {
+      clearTimeout(
+        copyStateTimerRef.current,
+      );
     }
 
-    copyStateTimerRef.current = setTimeout(() => {
-      setCopyState("idle");
-    }, 1800);
+    copyStateTimerRef.current =
+      setTimeout(() => {
+        setCopyState("idle");
+      }, 1800);
   }
 
-  async function copyText(text, message) {
+  async function copyText(
+    text,
+    message,
+  ) {
     if (!text?.trim()) {
-      showCopyMessage("Nothing to copy");
+      showCopyMessage(
+        "Nothing to copy",
+      );
 
       return false;
     }
 
     try {
-      await navigator.clipboard.writeText(text);
+      await navigator.clipboard.writeText(
+        text,
+      );
 
-      showCopyMessage(message);
+      showCopyMessage(
+        message,
+      );
 
       return true;
     } catch (err) {
       console.error(err);
 
-      showCopyMessage("Copy failed");
+      showCopyMessage(
+        "Copy failed",
+      );
 
       return false;
     }
@@ -1232,22 +2710,35 @@ function App() {
 
     if (!selection) return;
 
-    const items = itemsInsideSelection();
+    const items =
+      itemsInsideSelection();
 
     if (!items.length) {
-      showCopyMessage("No text found in selection");
+      showCopyMessage(
+        "No text found in selection",
+      );
 
       return;
     }
 
-    const text = convertItemsToExcel(items);
+    const text =
+      convertItemsToExcel(
+        items,
+      );
 
-    const rows = buildCells(items);
+    const rows =
+      buildCells(items);
 
-    const copied = await copyText(
-      text,
-      `Copied ${rows.length} row${rows.length === 1 ? "" : "s"}`,
-    );
+    const copied =
+      await copyText(
+        text,
+        `Copied ${rows.length} row${
+          rows.length ===
+          1
+            ? ""
+            : "s"
+        }`,
+      );
 
     if (copied) {
       setSelectionMode(false);
@@ -1260,28 +2751,46 @@ function App() {
   ========================================================== */
 
   async function copyPage() {
-    const targetPage = pageNumber;
+    const targetPage =
+      pageNumber;
 
-    const items = await getPageText(targetPage);
+    const items =
+      await getPageText(
+        targetPage,
+      );
 
-    const text = convertItemsToExcel(items);
+    const text =
+      convertItemsToExcel(
+        items,
+      );
 
     if (!text.trim()) {
-      showCopyMessage(`Page ${targetPage} has no text`);
+      showCopyMessage(
+        `Page ${targetPage} has no text`,
+      );
 
       return;
     }
 
-    const copied = await copyText(text, `Page ${targetPage} copied`);
+    const copied =
+      await copyText(
+        text,
+        `Page ${targetPage} copied`,
+      );
 
     if (copied) {
-      showCopyState("copied");
+      showCopyState(
+        "copied",
+      );
     }
   }
 
-  const structuredSelectionItems = itemsInsideSelection();
+  const structuredSelectionItems =
+    itemsInsideSelection();
 
-  const hasStructuredSelection = structuredSelectionItems.length > 0;
+  const hasStructuredSelection =
+    structuredSelectionItems.length >
+    0;
 
   /* ==========================================================
      RENDER
@@ -1294,17 +2803,32 @@ function App() {
       onKeyDown={(event) => {
         if (!pdf) return;
 
-        if (event.key === "ArrowRight") {
+        if (
+          event.key ===
+          "ArrowRight"
+        ) {
           event.preventDefault();
-          goToPage(pageNumber + 1);
+
+          goToPage(
+            pageNumber + 1,
+          );
         }
 
-        if (event.key === "ArrowLeft") {
+        if (
+          event.key ===
+          "ArrowLeft"
+        ) {
           event.preventDefault();
-          goToPage(pageNumber - 1);
+
+          goToPage(
+            pageNumber - 1,
+          );
         }
 
-        if (event.key === "Escape") {
+        if (
+          event.key ===
+          "Escape"
+        ) {
           if (selectionMode) {
             cancelSelectionMode();
           }
@@ -1317,7 +2841,9 @@ function App() {
             <div className="flex h-8 w-8 items-center justify-center">
               <div className="relative h-6 w-6">
                 <div className="absolute left-0 top-3 h-[2px] w-6 bg-slate-500" />
+
                 <div className="absolute left-[11px] top-1 h-5 w-[2px] bg-[#6f89b8]" />
+
                 <div className="absolute left-[3px] top-0 h-3 w-[18px] rounded-t-full border-2 border-slate-500 border-b-0" />
               </div>
             </div>
@@ -1356,7 +2882,9 @@ function App() {
           </div>
 
           <button
-            onClick={() => fileInputRef.current?.click()}
+            onClick={() =>
+              fileInputRef.current?.click()
+            }
             className="shrink-0 rounded-md border border-white/[0.08] bg-white/[0.035] px-3 py-1.5 text-[9px] font-medium uppercase tracking-[0.12em] text-slate-400 transition hover:bg-white/[0.06] hover:text-white"
           >
             Open PDF
@@ -1367,7 +2895,9 @@ function App() {
             type="file"
             accept="application/pdf,.pdf"
             className="hidden"
-            onChange={handleFileChange}
+            onChange={
+              handleFileChange
+            }
           />
         </div>
 
@@ -1381,30 +2911,49 @@ function App() {
           >
             <div
               className={`flex flex-wrap items-center justify-between gap-2 py-1.5 ${
-                toolbarPinned ? "px-2" : ""
+                toolbarPinned
+                  ? "px-2"
+                  : ""
               }`}
             >
               <div
                 className={`pointer-events-auto flex items-center gap-1.5 rounded-xl border border-white/[0.08] bg-[#0b1017]/70 px-1.5 py-1 shadow-lg backdrop-blur-xl ${
-                  toolbarPinned ? "bg-transparent shadow-none" : ""
+                  toolbarPinned
+                    ? "bg-transparent shadow-none"
+                    : ""
                 }`}
               >
                 <button
-                  onClick={() => goToPage(pageNumber - 1)}
-                  disabled={pageNumber <= 1}
+                  onClick={() =>
+                    goToPage(
+                      pageNumber - 1,
+                    )
+                  }
+                  disabled={
+                    pageNumber <= 1
+                  }
                   className="flex h-7 w-7 items-center justify-center rounded-md text-slate-500 transition hover:bg-white/[0.06] hover:text-white disabled:opacity-20"
                 >
                   ←
                 </button>
 
                 <div className="min-w-[58px] text-center text-[10px] tabular-nums text-slate-500">
-                  <span className="text-slate-200">{pageNumber}</span> /{" "}
-                  {numPages}
+                  <span className="text-slate-200">
+                    {pageNumber}
+                  </span>{" "}
+                  / {numPages}
                 </div>
 
                 <button
-                  onClick={() => goToPage(pageNumber + 1)}
-                  disabled={pageNumber >= numPages}
+                  onClick={() =>
+                    goToPage(
+                      pageNumber + 1,
+                    )
+                  }
+                  disabled={
+                    pageNumber >=
+                    numPages
+                  }
                   className="flex h-7 w-7 items-center justify-center rounded-md text-slate-500 transition hover:bg-white/[0.06] hover:text-white disabled:opacity-20"
                 >
                   →
@@ -1413,9 +2962,14 @@ function App() {
                 <div className="mx-1 h-5 w-px bg-white/[0.07]" />
 
                 <button
-                  onClick={() => setViewMode("continuous")}
+                  onClick={() =>
+                    setViewMode(
+                      "continuous",
+                    )
+                  }
                   className={`rounded-md px-2.5 py-1.5 text-[9px] uppercase tracking-[0.1em] transition ${
-                    viewMode === "continuous"
+                    viewMode ===
+                    "continuous"
                       ? "bg-white/[0.09] text-white"
                       : "text-slate-600 hover:text-slate-300"
                   }`}
@@ -1424,9 +2978,14 @@ function App() {
                 </button>
 
                 <button
-                  onClick={() => setViewMode("single")}
+                  onClick={() =>
+                    setViewMode(
+                      "single",
+                    )
+                  }
                   className={`rounded-md px-2.5 py-1.5 text-[9px] uppercase tracking-[0.1em] transition ${
-                    viewMode === "single"
+                    viewMode ===
+                    "single"
                       ? "bg-white/[0.09] text-white"
                       : "text-slate-600 hover:text-slate-300"
                   }`}
@@ -1437,23 +2996,40 @@ function App() {
                 <div className="mx-1 h-5 w-px bg-white/[0.07]" />
 
                 <button
-                  onClick={() => changeZoom(-ZOOM_STEP)}
-                  disabled={zoom <= MIN_ZOOM}
+                  onClick={() =>
+                    changeZoom(
+                      -ZOOM_STEP,
+                    )
+                  }
+                  disabled={
+                    zoom <= MIN_ZOOM
+                  }
                   className="flex h-7 w-7 items-center justify-center rounded-md text-slate-500 transition hover:bg-white/[0.06] hover:text-white disabled:opacity-20"
                 >
                   −
                 </button>
 
                 <button
-                  onClick={resetZoom}
+                  onClick={
+                    resetZoom
+                  }
                   className="min-w-[42px] rounded-md px-1 py-1.5 text-[9px] tabular-nums text-slate-500 transition hover:bg-white/[0.06] hover:text-white"
                 >
-                  {Math.round(zoom * 100)}%
+                  {Math.round(
+                    zoom * 100,
+                  )}
+                  %
                 </button>
 
                 <button
-                  onClick={() => changeZoom(ZOOM_STEP)}
-                  disabled={zoom >= MAX_ZOOM}
+                  onClick={() =>
+                    changeZoom(
+                      ZOOM_STEP,
+                    )
+                  }
+                  disabled={
+                    zoom >= MAX_ZOOM
+                  }
                   className="flex h-7 w-7 items-center justify-center rounded-md text-slate-500 transition hover:bg-white/[0.06] hover:text-white disabled:opacity-20"
                 >
                   +
@@ -1462,11 +3038,15 @@ function App() {
 
               <div
                 className={`pointer-events-auto flex items-center gap-1.5 rounded-xl border border-white/[0.08] bg-[#0b1017]/70 px-1.5 py-1 shadow-lg backdrop-blur-xl ${
-                  toolbarPinned ? "bg-transparent shadow-none" : ""
+                  toolbarPinned
+                    ? "bg-transparent shadow-none"
+                    : ""
                 }`}
               >
                 <button
-                  onClick={copySelection}
+                  onClick={
+                    copySelection
+                  }
                   className={`rounded-md border px-3 py-1.5 text-[9px] font-medium uppercase tracking-[0.1em] transition ${
                     hasStructuredSelection
                       ? "border-blue-400 bg-blue-600 text-white shadow-[0_0_14px_rgba(37,99,235,0.35)] hover:bg-blue-500"
@@ -1490,30 +3070,47 @@ function App() {
                 </button>
 
                 <button
-                  onClick={copyPage}
+                  onClick={
+                    copyPage
+                  }
                   className={`rounded-md border px-3 py-1.5 text-[9px] font-medium uppercase tracking-[0.1em] transition ${
-                    copyState === "copied"
+                    copyState ===
+                    "copied"
                       ? "border-emerald-400/20 bg-emerald-400/10 text-emerald-300"
                       : "border-white/[0.07] bg-white/[0.025] text-slate-400 hover:bg-white/[0.06] hover:text-white"
                   }`}
                 >
-                  {copyState === "copied" ? "✓ Copied" : "Copy Page"}
+                  {copyState ===
+                  "copied"
+                    ? "✓ Copied"
+                    : "Copy Page"}
                 </button>
 
                 <div className="mx-0.5 h-5 w-px bg-white/[0.07]" />
 
                 <button
-                  onClick={() => setToolbarPinned((current) => !current)}
+                  onClick={() =>
+                    setToolbarPinned(
+                      (current) =>
+                        !current,
+                    )
+                  }
                   className={`flex h-7 w-7 items-center justify-center rounded-md border transition ${
                     toolbarPinned
                       ? "border-[#6f89b8]/30 bg-[#536d9f]/15 text-[#b9c9e5]"
                       : "border-transparent text-slate-600 hover:bg-white/[0.06] hover:text-slate-300"
                   }`}
-                  title={toolbarPinned ? "Unpin toolbar" : "Pin toolbar"}
+                  title={
+                    toolbarPinned
+                      ? "Unpin toolbar"
+                      : "Pin toolbar"
+                  }
                 >
                   <span
                     className={`text-[12px] ${
-                      toolbarPinned ? "rotate-0" : "rotate-45"
+                      toolbarPinned
+                        ? "rotate-0"
+                        : "rotate-45"
                     }`}
                   >
                     ●
@@ -1533,42 +3130,101 @@ function App() {
         <div
           ref={viewerRef}
           className={`relative overflow-x-auto rounded-xl border border-white/[0.07] bg-[#10151d] shadow-[0_25px_80px_rgba(0,0,0,0.25)] ${
-            pdf ? "" : "h-[calc(100vh-58px)] min-h-[650px]"
+            pdf
+              ? ""
+              : "h-[calc(100vh-58px)] min-h-[650px]"
           }`}
         >
           {!pdf ? (
-            <EmptyState onOpen={() => fileInputRef.current?.click()} />
-          ) : viewMode === "continuous" ? (
+            <EmptyState
+              onOpen={() =>
+                fileInputRef.current?.click()
+              }
+            />
+          ) : viewMode ===
+            "continuous" ? (
             <ContinuousDocument
-              numPages={numPages}
-              pageNumber={pageNumber}
-              pageWidth={pageWidth}
-              pageHeight={pageHeight}
-              documentHeight={documentHeight}
-              pageDataCacheRef={pageDataCacheRef}
-              selection={selection}
-              dragging={dragging}
-              selectionMode={selectionMode}
-              onBeginSelection={beginSelection}
-              onUpdateSelection={updateSelection}
-              onFinishSelection={finishSelection}
-              renderPage={renderContinuousPage}
-              buffer={PAGE_BUFFER}
+              numPages={
+                numPages
+              }
+              pageNumber={
+                pageNumber
+              }
+              pageWidth={
+                pageWidth
+              }
+              pageHeight={
+                pageHeight
+              }
+              documentHeight={
+                documentHeight
+              }
+              pageDataCacheRef={
+                pageDataCacheRef
+              }
+              selection={
+                selection
+              }
+              dragging={
+                dragging
+              }
+              selectionMode={
+                selectionMode
+              }
+              onBeginSelection={
+                beginSelection
+              }
+              onUpdateSelection={
+                updateSelection
+              }
+              onFinishSelection={
+                finishSelection
+              }
+              renderPage={
+                renderContinuousPage
+              }
+              buffer={
+                PAGE_BUFFER
+              }
             />
           ) : (
             <SingleDocument
-              pageWidth={pageWidth}
-              pageHeight={pageHeight}
-              pageData={singlePageData}
-              canvasRef={singleCanvasRef}
-              selection={selection}
-              dragging={dragging}
-              selectionMode={selectionMode}
-              loading={loading}
-              onBeginSelection={beginSelection}
-              onUpdateSelection={updateSelection}
-              onFinishSelection={finishSelection}
-              pageNumber={pageNumber}
+              pageWidth={
+                pageWidth
+              }
+              pageHeight={
+                pageHeight
+              }
+              pageData={
+                singlePageData
+              }
+              canvasRef={
+                singleCanvasRef
+              }
+              selection={
+                selection
+              }
+              dragging={
+                dragging
+              }
+              selectionMode={
+                selectionMode
+              }
+              loading={
+                loading
+              }
+              onBeginSelection={
+                beginSelection
+              }
+              onUpdateSelection={
+                updateSelection
+              }
+              onFinishSelection={
+                finishSelection
+              }
+              pageNumber={
+                pageNumber
+              }
             />
           )}
 
@@ -1582,13 +3238,14 @@ function App() {
             </div>
           )}
 
-          {selectionMode && !selection && (
-            <div className="pointer-events-none absolute bottom-5 left-1/2 z-[90] -translate-x-1/2">
-              <div className="rounded-lg border border-white/[0.08] bg-[#0b1017]/80 px-3 py-2 text-[9px] uppercase tracking-[0.1em] text-slate-500 shadow-xl backdrop-blur-md">
-                Drag across the area to copy
+          {selectionMode &&
+            !selection && (
+              <div className="pointer-events-none absolute bottom-5 left-1/2 z-[90] -translate-x-1/2">
+                <div className="rounded-lg border border-white/[0.08] bg-[#0b1017]/80 px-3 py-2 text-[9px] uppercase tracking-[0.1em] text-slate-500 shadow-xl backdrop-blur-md">
+                  Drag across the area to copy
+                </div>
               </div>
-            </div>
-          )}
+            )}
         </div>
 
         {pdf && (
@@ -1627,57 +3284,104 @@ function ContinuousDocument({
   renderPage,
   buffer,
 }) {
-  const startPage = Math.max(1, pageNumber - buffer);
+  const startPage =
+    Math.max(
+      1,
+      pageNumber - buffer,
+    );
 
-  const endPage = Math.min(numPages, pageNumber + buffer);
+  const endPage =
+    Math.min(
+      numPages,
+      pageNumber + buffer,
+    );
 
   return (
     <div
       className="relative w-full"
       style={{
-        minHeight: documentHeight + 56,
+        minHeight:
+          documentHeight + 56,
       }}
     >
       <div className="flex w-full flex-col items-center px-5 py-7">
-        {Array.from({ length: numPages }, (_, index) => {
-          const targetPage = index + 1;
+        {Array.from(
+          {
+            length: numPages,
+          },
+          (_, index) => {
+            const targetPage =
+              index + 1;
 
-          const active = targetPage >= startPage && targetPage <= endPage;
+            const active =
+              targetPage >=
+                startPage &&
+              targetPage <=
+                endPage;
 
-          return (
-            <div
-              key={targetPage}
-              className="relative flex w-full justify-center"
-              style={{
-                height: pageHeight,
-                marginBottom: targetPage === numPages ? 0 : PAGE_GAP,
-              }}
-            >
-              {active ? (
-                <VirtualPage
-                  pageNum={targetPage}
-                  pageWidth={pageWidth}
-                  pageHeight={pageHeight}
-                  pageDataCacheRef={pageDataCacheRef}
-                  selection={selection}
-                  dragging={dragging}
-                  selectionMode={selectionMode}
-                  onBeginSelection={onBeginSelection}
-                  onUpdateSelection={onUpdateSelection}
-                  onFinishSelection={onFinishSelection}
-                  renderPage={renderPage}
-                />
-              ) : (
-                <div
-                  className="h-full bg-white/[0.012]"
-                  style={{
-                    width: pageWidth,
-                  }}
-                />
-              )}
-            </div>
-          );
-        })}
+            return (
+              <div
+                key={targetPage}
+                className="relative flex w-full justify-center"
+                style={{
+                  height:
+                    pageHeight,
+                  marginBottom:
+                    targetPage ===
+                    numPages
+                      ? 0
+                      : PAGE_GAP,
+                }}
+              >
+                {active ? (
+                  <VirtualPage
+                    pageNum={
+                      targetPage
+                    }
+                    pageWidth={
+                      pageWidth
+                    }
+                    pageHeight={
+                      pageHeight
+                    }
+                    pageDataCacheRef={
+                      pageDataCacheRef
+                    }
+                    selection={
+                      selection
+                    }
+                    dragging={
+                      dragging
+                    }
+                    selectionMode={
+                      selectionMode
+                    }
+                    onBeginSelection={
+                      onBeginSelection
+                    }
+                    onUpdateSelection={
+                      onUpdateSelection
+                    }
+                    onFinishSelection={
+                      onFinishSelection
+                    }
+                    renderPage={
+                      renderPage
+                    }
+                  />
+                ) : (
+                  <div
+                    className="h-full bg-white/[0.012]"
+                    style={{
+                      width:
+                        pageWidth,
+                    }}
+                  />
+                )}
+              </div>
+            );
+          },
+        )}
       </div>
     </div>
   );
@@ -1687,165 +3391,265 @@ function ContinuousDocument({
    VIRTUAL PAGE
 ============================================================ */
 
-const VirtualPage = memo(function VirtualPage({
-  pageNum,
-  pageWidth,
-  pageHeight,
-  pageDataCacheRef,
-  selection,
-  dragging,
-  selectionMode,
-  onBeginSelection,
-  onUpdateSelection,
-  onFinishSelection,
-  renderPage,
-}) {
-  const canvasRef = useRef(null);
+const VirtualPage = memo(
+  function VirtualPage({
+    pageNum,
+    pageWidth,
+    pageHeight,
+    pageDataCacheRef,
+    selection,
+    dragging,
+    selectionMode,
+    onBeginSelection,
+    onUpdateSelection,
+    onFinishSelection,
+    renderPage,
+  }) {
+    const canvasRef =
+      useRef(null);
 
-  const [pageData, setPageData] = useState(
-    pageDataCacheRef.current.get(pageNum) || null,
-  );
+    const [pageData, setPageData] =
+      useState(
+        pageDataCacheRef.current.get(
+          pageNum,
+        ) || null,
+      );
 
-  const [ready, setReady] = useState(false);
+    const [ready, setReady] =
+      useState(false);
 
-  useEffect(() => {
-    let cancelled = false;
+    useEffect(() => {
+      let cancelled = false;
 
-    async function prepare() {
-      if (!canvasRef.current) {
-        return;
+      async function prepare() {
+        if (
+          !canvasRef.current
+        ) {
+          return;
+        }
+
+        const existing =
+          pageDataCacheRef.current.get(
+            pageNum,
+          );
+
+        if (existing) {
+          setPageData(
+            existing,
+          );
+
+          setReady(true);
+        }
+
+        const result =
+          await renderPage(
+            pageNum,
+            canvasRef.current,
+          );
+
+        if (cancelled) {
+          return;
+        }
+
+        if (result) {
+          setPageData(result);
+          setReady(true);
+        }
       }
 
-      const existing = pageDataCacheRef.current.get(pageNum);
+      prepare();
 
-      if (existing) {
-        setPageData(existing);
-        setReady(true);
-      }
+      return () => {
+        cancelled = true;
+      };
+    }, [
+      pageNum,
+      renderPage,
+    ]);
 
-      const result = await renderPage(pageNum, canvasRef.current);
+    const actualViewport =
+      pageData?.viewport || {
+        width: pageWidth,
+        height: pageHeight,
+      };
 
-      if (cancelled) return;
+    const baseWidth =
+      pageData?.baseWidth ||
+      actualViewport.width;
 
-      if (result) {
-        setPageData(result);
-        setReady(true);
-      }
+    const baseHeight =
+      pageData?.baseHeight ||
+      actualViewport.height;
+
+    const isSelectedPage =
+      selection?.pageNumber ===
+      pageNum;
+
+    let selectionStyle =
+      null;
+
+    if (
+      isSelectedPage &&
+      selection
+    ) {
+      const left =
+        (selection.x /
+          baseWidth) *
+        100;
+
+      const top =
+        (1 -
+          (selection.y +
+            selection.height) /
+            baseHeight) *
+        100;
+
+      const width =
+        (selection.width /
+          baseWidth) *
+        100;
+
+      const height =
+        (selection.height /
+          baseHeight) *
+        100;
+
+      selectionStyle = {
+        left: `${left}%`,
+        top: `${top}%`,
+        width: `${width}%`,
+        height: `${height}%`,
+      };
     }
 
-    prepare();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [pageNum, renderPage]);
-
-  const actualViewport = pageData?.viewport || {
-    width: pageWidth,
-    height: pageHeight,
-  };
-
-  const baseWidth = pageData?.baseWidth || actualViewport.width;
-
-  const baseHeight = pageData?.baseHeight || actualViewport.height;
-
-  const isSelectedPage = selection?.pageNumber === pageNum;
-
-  let selectionStyle = null;
-
-  if (isSelectedPage && selection) {
-    const left = (selection.x / baseWidth) * 100;
-
-    const top = (1 - (selection.y + selection.height) / baseHeight) * 100;
-
-    const width = (selection.width / baseWidth) * 100;
-
-    const height = (selection.height / baseHeight) * 100;
-
-    selectionStyle = {
-      left: `${left}%`,
-      top: `${top}%`,
-      width: `${width}%`,
-      height: `${height}%`,
-    };
-  }
-
-  return (
-    <div
-      className={`relative flex-none overflow-hidden bg-white shadow-[0_25px_70px_rgba(0,0,0,0.35)] ${
-        selectionMode ? "cursor-crosshair select-none" : "cursor-text"
-      }`}
-      style={{
-        width: actualViewport.width,
-        height: actualViewport.height,
-      }}
-      onPointerDown={(event) =>
-        onBeginSelection(event, pageNum, pageData, event.currentTarget)
-      }
-      onPointerMove={(event) =>
-        onUpdateSelection(event, pageNum, pageData, event.currentTarget)
-      }
-      onPointerUp={onFinishSelection}
-      onPointerCancel={onFinishSelection}
-    >
-      <canvas
-        ref={canvasRef}
-        className="absolute inset-0 block h-full w-full"
-      />
-
-      {!ready && <div className="absolute inset-0 bg-white" />}
-
-      {pageData?.items?.length > 0 && (
-        <div
-          className={`absolute inset-0 ${
-            selectionMode ? "pointer-events-none" : "pointer-events-auto"
-          }`}
-        >
-          {pageData.items.map((item, index) => {
-            const left = (item.x / baseWidth) * 100;
-
-            const top = (1 - (item.y + item.height) / baseHeight) * 100;
-
-            const width = (item.width / baseWidth) * 100;
-
-            const height = (item.height / baseHeight) * 100;
-
-            return (
-              <span
-                key={`${pageNum}-${index}-${item.x}-${item.y}`}
-                className="absolute whitespace-pre text-transparent selection:bg-[#6f89b8]/30"
-                style={{
-                  left: `${left}%`,
-                  top: `${top}%`,
-                  width: `${width}%`,
-                  height: `${height}%`,
-                  fontSize: `${Math.max(
-                    7,
-                    (item.height / baseHeight) * actualViewport.height,
-                  )}px`,
-                  lineHeight: 1,
-                }}
-              >
-                {item.text}
-              </span>
-            );
-          })}
-        </div>
-      )}
-
-      {selectionStyle && selectionMode && (
-        <div
-          className={`pointer-events-none absolute z-30 border ${
-            dragging
-              ? "border-[#7890bd] bg-[#7890bd]/15"
-              : "border-[#6f89b8] bg-[#6f89b8]/10"
-          }`}
-          style={selectionStyle}
+    return (
+      <div
+        className={`relative flex-none overflow-hidden bg-white shadow-[0_25px_70px_rgba(0,0,0,0.35)] ${
+          selectionMode
+            ? "cursor-crosshair select-none"
+            : "cursor-text"
+        }`}
+        style={{
+          width:
+            actualViewport.width,
+          height:
+            actualViewport.height,
+        }}
+        onPointerDown={(
+          event,
+        ) =>
+          onBeginSelection(
+            event,
+            pageNum,
+            pageData,
+            event.currentTarget,
+          )
+        }
+        onPointerMove={(
+          event,
+        ) =>
+          onUpdateSelection(
+            event,
+            pageNum,
+            pageData,
+            event.currentTarget,
+          )
+        }
+        onPointerUp={
+          onFinishSelection
+        }
+        onPointerCancel={
+          onFinishSelection
+        }
+      >
+        <canvas
+          ref={canvasRef}
+          className="absolute inset-0 block h-full w-full"
         />
-      )}
-    </div>
-  );
-});
+
+        {!ready && (
+          <div className="absolute inset-0 bg-white" />
+        )}
+
+        {pageData?.items?.length >
+          0 && (
+          <div
+            className={`absolute inset-0 ${
+              selectionMode
+                ? "pointer-events-none"
+                : "pointer-events-auto"
+            }`}
+          >
+            {pageData.items.map(
+              (
+                item,
+                index,
+              ) => {
+                const left =
+                  (item.x /
+                    baseWidth) *
+                  100;
+
+                const top =
+                  (1 -
+                    (item.y +
+                      item.height) /
+                      baseHeight) *
+                  100;
+
+                const width =
+                  (item.width /
+                    baseWidth) *
+                  100;
+
+                const height =
+                  (item.height /
+                    baseHeight) *
+                  100;
+
+                return (
+                  <span
+                    key={`${pageNum}-${index}-${item.x}-${item.y}`}
+                    className="absolute whitespace-pre text-transparent selection:bg-[#6f89b8]/30"
+                    style={{
+                      left: `${left}%`,
+                      top: `${top}%`,
+                      width: `${width}%`,
+                      height: `${height}%`,
+                      fontSize: `${Math.max(
+                        7,
+                        (item.height /
+                          baseHeight) *
+                          actualViewport.height,
+                      )}px`,
+                      lineHeight: 1,
+                    }}
+                  >
+                    {item.text}
+                  </span>
+                );
+              },
+            )}
+          </div>
+        )}
+
+        {selectionStyle &&
+          selectionMode && (
+            <div
+              className={`pointer-events-none absolute z-30 border ${
+                dragging
+                  ? "border-[#7890bd] bg-[#7890bd]/15"
+                  : "border-[#6f89b8] bg-[#6f89b8]/10"
+              }`}
+              style={
+                selectionStyle
+              }
+            />
+          )}
+      </div>
+    );
+  },
+);
 
 /* ============================================================
    SINGLE DOCUMENT
@@ -1865,26 +3669,55 @@ function SingleDocument({
   onFinishSelection,
   pageNumber,
 }) {
-  const viewport = pageData?.viewport || {
-    width: pageWidth,
-    height: pageHeight,
-  };
+  const viewport =
+    pageData?.viewport || {
+      width: pageWidth,
+      height: pageHeight,
+    };
 
-  const baseWidth = pageData?.baseWidth || viewport.width;
+  const baseWidth =
+    pageData?.baseWidth ||
+    viewport.width;
 
-  const baseHeight = pageData?.baseHeight || viewport.height;
+  const baseHeight =
+    pageData?.baseHeight ||
+    viewport.height;
 
-  let selectionStyle = null;
+  let selectionStyle =
+    null;
 
-  if (selection && selection.pageNumber === pageNumber && pageData) {
+  if (
+    selection &&
+    selection.pageNumber ===
+      pageNumber &&
+    pageData
+  ) {
     selectionStyle = {
-      left: (selection.x / baseWidth) * 100 + "%",
+      left:
+        (selection.x /
+          baseWidth) *
+          100 +
+        "%",
 
-      top: (1 - (selection.y + selection.height) / baseHeight) * 100 + "%",
+      top:
+        (1 -
+          (selection.y +
+            selection.height) /
+            baseHeight) *
+          100 +
+        "%",
 
-      width: (selection.width / baseWidth) * 100 + "%",
+      width:
+        (selection.width /
+          baseWidth) *
+          100 +
+        "%",
 
-      height: (selection.height / baseHeight) * 100 + "%",
+      height:
+        (selection.height /
+          baseHeight) *
+          100 +
+        "%",
     };
   }
 
@@ -1892,74 +3725,123 @@ function SingleDocument({
     <div className="flex min-h-full w-max min-w-full items-start justify-center px-5 py-7">
       <div
         className={`relative flex-none overflow-hidden bg-white shadow-[0_25px_70px_rgba(0,0,0,0.35)] ${
-          selectionMode ? "cursor-crosshair select-none" : "cursor-text"
+          selectionMode
+            ? "cursor-crosshair select-none"
+            : "cursor-text"
         }`}
         style={{
-          width: viewport.width,
-          height: viewport.height,
+          width:
+            viewport.width,
+          height:
+            viewport.height,
         }}
-        onPointerDown={(event) =>
-          onBeginSelection(event, pageNumber, pageData, event.currentTarget)
+        onPointerDown={(
+          event,
+        ) =>
+          onBeginSelection(
+            event,
+            pageNumber,
+            pageData,
+            event.currentTarget,
+          )
         }
-        onPointerMove={(event) =>
-          onUpdateSelection(event, pageNumber, pageData, event.currentTarget)
+        onPointerMove={(
+          event,
+        ) =>
+          onUpdateSelection(
+            event,
+            pageNumber,
+            pageData,
+            event.currentTarget,
+          )
         }
-        onPointerUp={onFinishSelection}
-        onPointerCancel={onFinishSelection}
+        onPointerUp={
+          onFinishSelection
+        }
+        onPointerCancel={
+          onFinishSelection
+        }
       >
         <canvas
           ref={canvasRef}
           className="absolute inset-0 block h-full w-full"
         />
 
-        {pageData?.items?.length > 0 && (
+        {pageData?.items?.length >
+          0 && (
           <div
             className={`absolute inset-0 ${
-              selectionMode ? "pointer-events-none" : "pointer-events-auto"
+              selectionMode
+                ? "pointer-events-none"
+                : "pointer-events-auto"
             }`}
           >
-            {pageData.items.map((item, index) => {
-              const left = (item.x / baseWidth) * 100;
+            {pageData.items.map(
+              (
+                item,
+                index,
+              ) => {
+                const left =
+                  (item.x /
+                    baseWidth) *
+                  100;
 
-              const top = (1 - (item.y + item.height) / baseHeight) * 100;
+                const top =
+                  (1 -
+                    (item.y +
+                      item.height) /
+                      baseHeight) *
+                  100;
 
-              const width = (item.width / baseWidth) * 100;
+                const width =
+                  (item.width /
+                    baseWidth) *
+                  100;
 
-              const height = (item.height / baseHeight) * 100;
+                const height =
+                  (item.height /
+                    baseHeight) *
+                  100;
 
-              return (
-                <span
-                  key={`${index}-${item.x}-${item.y}`}
-                  className="absolute whitespace-pre text-transparent selection:bg-[#6f89b8]/30"
-                  style={{
-                    left: `${left}%`,
-                    top: `${top}%`,
-                    width: `${width}%`,
-                    height: `${height}%`,
-                    fontSize: `${Math.max(
-                      7,
-                      (item.height / baseHeight) * viewport.height,
-                    )}px`,
-                    lineHeight: 1,
-                  }}
-                >
-                  {item.text}
-                </span>
-              );
-            })}
+                return (
+                  <span
+                    key={`${index}-${item.x}-${item.y}`}
+                    className="absolute whitespace-pre text-transparent selection:bg-[#6f89b8]/30"
+                    style={{
+                      left: `${left}%`,
+                      top: `${top}%`,
+                      width: `${width}%`,
+                      height: `${height}%`,
+                      fontSize: `${Math.max(
+                        7,
+                        (item.height /
+                          baseHeight) *
+                          viewport.height,
+                      )}px`,
+                      lineHeight: 1,
+                    }}
+                  >
+                    {item.text}
+                  </span>
+                );
+              },
+            )}
           </div>
         )}
 
-        {selectionStyle && selectionMode && (
-          <div
-            className={`pointer-events-none absolute z-30 border ${
-              dragging
-                ? "border-[#7890bd] bg-[#7890bd]/15"
-                : "border-[#6f89b8] bg-[#6f89b8]/10"
-            }`}
-            style={selectionStyle}
-          />
-        )}
+        {selectionStyle &&
+          selectionMode && (
+            <div
+              className={`pointer-events-none absolute z-30 border ${
+                dragging
+                  ? "border-[#7890bd] bg-[#7890bd]/15"
+                  : "border-[#6f89b8] bg-[#6f89b8]/10"
+              }`}
+              style={
+                selectionStyle
+              }
+            />
+          )}
 
         {loading && (
           <div className="absolute inset-0 z-40 flex items-center justify-center bg-white/60">
@@ -1979,7 +3861,9 @@ function SingleDocument({
    EMPTY STATE
 ============================================================ */
 
-function EmptyState({ onOpen }) {
+function EmptyState({
+  onOpen,
+}) {
   return (
     <div className="relative h-full overflow-hidden bg-[#0c1118]">
       <div className="pointer-events-none absolute inset-0">
@@ -2004,18 +3888,22 @@ function EmptyState({ onOpen }) {
             </h1>
 
             <p className="mt-4 max-w-xl text-[13px] leading-5.5 text-slate-500">
-              Read documents normally, decide what matters, and select only the
-              information you need. E-BRIDGE handles the mechanical work of
-              extracting it into Excel, while you stay in control of the
-              analysis.
+              Read documents normally, decide what
+              matters, and select only the information
+              you need. E-BRIDGE handles the mechanical
+              work of extracting it into Excel, while you
+              stay in control of the analysis.
             </p>
 
             <div className="mt-5 flex flex-wrap items-center gap-4">
               <button
-                onClick={onOpen}
+                onClick={
+                  onOpen
+                }
                 className="group flex items-center gap-3 rounded-lg bg-slate-200 px-5 py-2.5 text-[10px] font-semibold uppercase tracking-[0.16em] text-[#080b10] transition hover:bg-white"
               >
                 Open PDF
+
                 <svg
                   viewBox="0 0 16 16"
                   fill="none"
@@ -2061,17 +3949,19 @@ function EmptyState({ onOpen }) {
                       <div className="h-6" />
                     </div>
 
-                    {[1, 2, 3, 4].map((row) => (
-                      <div
-                        key={row}
-                        className="grid grid-cols-4 border-b border-white/[0.045] last:border-0"
-                      >
-                        <div className="h-7 border-r border-white/[0.045]" />
-                        <div className="h-7 border-r border-white/[0.045]" />
-                        <div className="h-7 border-r border-white/[0.045]" />
-                        <div className="h-7" />
-                      </div>
-                    ))}
+                    {[1, 2, 3, 4].map(
+                      (row) => (
+                        <div
+                          key={row}
+                          className="grid grid-cols-4 border-b border-white/[0.045] last:border-0"
+                        >
+                          <div className="h-7 border-r border-white/[0.045]" />
+                          <div className="h-7 border-r border-white/[0.045]" />
+                          <div className="h-7 border-r border-white/[0.045]" />
+                          <div className="h-7" />
+                        </div>
+                      ),
+                    )}
 
                     <div className="pointer-events-none absolute left-7 right-7 top-[38px] h-[82px] rounded border border-slate-400/30 bg-slate-400/[0.035]" />
                   </div>
@@ -2097,11 +3987,13 @@ function EmptyState({ onOpen }) {
               01
             </div>
 
-            <h2 className="mt-2 text-sm font-medium text-slate-300">Read</h2>
+            <h2 className="mt-2 text-sm font-medium text-slate-300">
+              Read
+            </h2>
 
             <p className="mt-1.5 max-w-xs text-[10px] leading-4.5 text-slate-600">
-              Read the document normally and use your own judgement to identify
-              what matters.
+              Read the document normally and use your own
+              judgement to identify what matters.
             </p>
           </div>
 
@@ -2110,11 +4002,13 @@ function EmptyState({ onOpen }) {
               02
             </div>
 
-            <h2 className="mt-2 text-sm font-medium text-slate-300">Select</h2>
+            <h2 className="mt-2 text-sm font-medium text-slate-300">
+              Select
+            </h2>
 
             <p className="mt-1.5 max-w-xs text-[10px] leading-4.5 text-slate-600">
-              Choose the exact table, section, or page you need. E-BRIDGE
-              handles the mechanical extraction.
+              Choose the exact table, section, or page you need.
+              E-BRIDGE handles the mechanical extraction.
             </p>
           </div>
 
@@ -2123,11 +4017,13 @@ function EmptyState({ onOpen }) {
               03
             </div>
 
-            <h2 className="mt-2 text-sm font-medium text-slate-300">Use</h2>
+            <h2 className="mt-2 text-sm font-medium text-slate-300">
+              Use
+            </h2>
 
             <p className="mt-1.5 max-w-xs text-[10px] leading-4.5 text-slate-600">
-              Copy the structured result directly into Excel and continue your
-              analysis.
+              Copy the structured result directly into Excel and
+              continue your analysis.
             </p>
           </div>
         </div>
@@ -2138,16 +4034,28 @@ function EmptyState({ onOpen }) {
           </div>
 
           <p className="mt-2 max-w-3xl text-[10px] leading-5 text-slate-700">
-            Currently tested on text-based annual reports. Image-based PDFs are
-            not supported. Tables with irregular layouts or missing cells may
-            require a quick visual check after pasting.
+            Currently tested on text-based annual reports.
+            Image-based PDFs are not supported. Tables with
+            irregular layouts or missing cells may require a
+            quick visual check after pasting.
           </p>
 
           <div className="mt-4 flex flex-wrap gap-x-6 gap-y-2 text-[8px] uppercase tracking-[0.15em] text-slate-700">
-            <span>Text PDFs</span>
-            <span>Annual Reports</span>
-            <span>Excel Clipboard</span>
-            <span>Local Processing</span>
+            <span>
+              Text PDFs
+            </span>
+
+            <span>
+              Annual Reports
+            </span>
+
+            <span>
+              Excel Clipboard
+            </span>
+
+            <span>
+              Local Processing
+            </span>
           </div>
         </div>
 
